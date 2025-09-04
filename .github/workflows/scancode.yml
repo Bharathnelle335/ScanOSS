@@ -120,32 +120,54 @@ jobs:
       - name: Convert JSON → CSV + Excel
         run: |
           python3 - <<'EOF'
-          import pandas as pd, json
-
-          try:
-              with open("scancode_report.json", "r", encoding="utf-8") as f:
-                  data = json.load(f)
-          except FileNotFoundError:
-              print("No JSON report found")
-              exit(0)
+          import pandas as pd, json, os, glob
 
           rows = []
-          for f in data.get("files", []):
-              rows.append({
-                  "path": f.get("path"),
-                  "type": f.get("type"),
-                  "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
-                  "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
-                  "authors": "; ".join([a.get("value","") for a in f.get("authors", [])]) if "authors" in f else "",
-                  "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]) if "emails" in f else "",
-                  "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]) if "urls" in f else "",
-              })
 
-          df = pd.DataFrame(rows)
-          if not df.empty:
+          for json_file in glob.glob("*.json"):
+              with open(json_file, "r", encoding="utf-8") as f:
+                  try:
+                      data = json.load(f)
+                  except Exception:
+                      continue
+
+              # Case 1: license findings (like your sample)
+              if isinstance(data, list) and "license_expression" in str(data[0]):
+                  for lic in data:
+                      for ref in lic.get("reference_matches", []):
+                          rows.append({
+                              "file_path": ref.get("from_file"),
+                              "license_expression": lic.get("license_expression"),
+                              "license_expression_spdx": lic.get("license_expression_spdx"),
+                              "start_line": ref.get("start_line"),
+                              "end_line": ref.get("end_line"),
+                              "matcher": ref.get("matcher"),
+                              "score": ref.get("score"),
+                              "rule_identifier": ref.get("rule_identifier"),
+                              "rule_url": ref.get("rule_url"),
+                              "matched_text": ref.get("matched_text"),
+                          })
+
+              # Case 2: file-by-file scans
+              elif isinstance(data, dict) and "files" in data:
+                  for f in data["files"]:
+                      rows.append({
+                          "path": f.get("path"),
+                          "type": f.get("type"),
+                          "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
+                          "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
+                          "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]),
+                          "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]),
+                      })
+
+          if rows:
+              df = pd.DataFrame(rows)
               df.to_csv("scancode_report.csv", index=False)
               df.to_excel("scancode_report.xlsx", index=False)
+          else:
+              print("⚠️ No rows extracted from JSON")
           EOF
+
 
       - name: Upload ScanCode reports
         uses: actions/upload-artifact@v4
