@@ -17,46 +17,25 @@ on:
         description: "Archive file (if scan_type=zip)"
         default: "sample.zip"
 
-      # ===== Feature Toggles =====
-      enable_license:
+      enable_license_scan:
         type: boolean
-        description: "Detect licenses"
+        description: "Run license + license-text detection"
         default: true
-      enable_license_text:
+      enable_copyright_scan:
         type: boolean
-        description: "Extract license texts"
-        default: false
-      enable_copyright:
-        type: boolean
-        description: "Detect copyright statements"
+        description: "Run copyright + author + email detection"
         default: true
-      enable_author:
+      enable_metadata_scan:
         type: boolean
-        description: "Detect authors"
-        default: false
-      enable_email:
-        type: boolean
-        description: "Extract emails"
-        default: false
-      enable_url:
-        type: boolean
-        description: "Extract URLs"
+        description: "Run metadata scans (urls + file info)"
         default: false
       enable_package:
         type: boolean
         description: "Detect packages and manifests"
         default: true
-      enable_info:
+      enable_sbom_export:
         type: boolean
-        description: "Collect file metadata (type, size, language)"
-        default: false
-      enable_spdx:
-        type: boolean
-        description: "Export SPDX JSON"
-        default: false
-      enable_cyclonedx:
-        type: boolean
-        description: "Export CycloneDX SBOM"
+        description: "Export SPDX and CycloneDX SBOM"
         default: false
 
 jobs:
@@ -115,25 +94,25 @@ jobs:
         run: |
           cd scancode-toolkit
           SCANCODE_OPTS=""
-          if [ "${{ github.event.inputs.enable_license }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --license"; fi
-          if [ "${{ github.event.inputs.enable_license_text }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --license-text"; fi
-          if [ "${{ github.event.inputs.enable_copyright }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --copyright"; fi
-          if [ "${{ github.event.inputs.enable_author }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --author"; fi
-          if [ "${{ github.event.inputs.enable_email }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --email"; fi
-          if [ "${{ github.event.inputs.enable_url }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --url"; fi
-          if [ "${{ github.event.inputs.enable_package }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --package"; fi
-          if [ "${{ github.event.inputs.enable_info }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --info"; fi
+
+          if [ "${{ github.event.inputs.enable_license_scan }}" = "true" ]; then
+            SCANCODE_OPTS="$SCANCODE_OPTS --license --license-text"
+          fi
+          if [ "${{ github.event.inputs.enable_copyright_scan }}" = "true" ]; then
+            SCANCODE_OPTS="$SCANCODE_OPTS --copyright --author --email"
+          fi
+          if [ "${{ github.event.inputs.enable_metadata_scan }}" = "true" ]; then
+            SCANCODE_OPTS="$SCANCODE_OPTS --url --info"
+          fi
+          if [ "${{ github.event.inputs.enable_package }}" = "true" ]; then
+            SCANCODE_OPTS="$SCANCODE_OPTS --package"
+          fi
 
           echo "⚡ Running ScanCode with options: $SCANCODE_OPTS"
           ./scancode $SCANCODE_OPTS --json-pp ../scancode_report.json $INPUT_PATH
 
-          # SPDX export
-          if [ "${{ github.event.inputs.enable_spdx }}" = "true" ]; then
+          if [ "${{ github.event.inputs.enable_sbom_export }}" = "true" ]; then
             ./scancode --spdx-json-pp ../scancode_report.spdx.json $INPUT_PATH
-          fi
-
-          # CycloneDX export
-          if [ "${{ github.event.inputs.enable_cyclonedx }}" = "true" ]; then
             ./scancode --cyclonedx-json ../scancode_report.cdx.json $INPUT_PATH
           fi
 
@@ -156,6 +135,7 @@ jobs:
                   "type": f.get("type"),
                   "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
                   "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
+                  "authors": "; ".join([a.get("value","") for a in f.get("authors", [])]) if "authors" in f else "",
                   "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]) if "emails" in f else "",
                   "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]) if "urls" in f else "",
               })
