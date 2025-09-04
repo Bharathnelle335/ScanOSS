@@ -112,9 +112,11 @@ jobs:
           ./scancode $SCANCODE_OPTS --json-pp ../scancode_report.json ../$INPUT_PATH
 
           if [ "${{ github.event.inputs.enable_sbom_export }}" = "true" ]; then
-            ./scancode --spdx-json-pp ../scancode_report.spdx.json ../$INPUT_PATH
-            ./scancode --cyclonedx-json ../scancode_report.cdx.json ../$INPUT_PATH
+          ./scancode --spdx-tv ../scancode_report.spdx.tv ../$INPUT_PATH
+          ./scancode --spdx-rdf ../scancode_report.spdx.rdf ../$INPUT_PATH
+          ./scancode --cyclonedx-json ../scancode_report.cdx.json ../$INPUT_PATH
           fi
+
 
 
       - name: Convert JSON → CSV + Excel
@@ -204,3 +206,14 @@ jobs:
 
             print("✅ Excel created with detail + management summary")
             EOF
+            
+      - name: Upload ScanCode reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: scancode-reports
+          path: |
+            scancode_report.json
+            scancode_report.xlsx
+            scancode_report.spdx.tv
+            scancode_report.spdx.rdf
+            scancode_report.cdx.json
