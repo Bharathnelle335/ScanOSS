@@ -48,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && \
-          sudo apt-get install -y git unzip docker.io jq python3 python3-pip && \
+          sudo apt-get install -y git unzip jq python3 python3-pip && \
           pip3 install pandas openpyxl
 
       - name: Prepare input
