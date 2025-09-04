@@ -129,7 +129,8 @@ jobs:
 
           licenses_rows, files_rows, packages_rows = [], [], []
 
-          for json_file in glob.glob("scancode_report*.json"):
+          # Look for all ScanCode JSON outputs
+          for json_file in glob.glob("scancode_*.json"):
               with open(json_file, "r", encoding="utf-8") as f:
                   try:
                       data = json.load(f)
@@ -223,6 +224,12 @@ jobs:
               if not df_pkg.empty: df_pkg.to_excel(w, "Packages", index=False)
               if not df_summary.empty: df_summary.to_excel(w, "Summary", index=False)
 
+              # 🔑 Ensure at least one sheet exists
+              if all(df.empty for df in [df_files, df_lic, df_pkg, df_summary]):
+                  pd.DataFrame([{"info": "No data extracted"}]).to_excel(
+                      w, sheet_name="Empty", index=False
+                  )
+
           print(f"✅ Wrote Excel: {out_xlsx}")
           EOF
 
@@ -236,4 +243,3 @@ jobs:
             scancode_${{ env.SCAN_LABEL }}.spdx.tv
             scancode_${{ env.SCAN_LABEL }}.spdx.rdf
             scancode_${{ env.SCAN_LABEL }}.cdx.json
-
