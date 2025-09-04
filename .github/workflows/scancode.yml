@@ -125,11 +125,10 @@ jobs:
       - name: Convert JSON → CSV + Excel
         run: |
           python3 - <<'EOF'
-          import pandas as pd, json, glob, os
+          import pandas as pd, json, os, glob
 
-          licenses_rows, files_rows, packages_rows = [], [], []
+          lic_rows, dep_rows, pkg_rows, file_rows = [], [], [], []
 
-          # Look for all ScanCode JSON outputs
           for json_file in glob.glob("scancode_*.json"):
               with open(json_file, "r", encoding="utf-8") as f:
                   try:
@@ -137,100 +136,100 @@ jobs:
                   except Exception:
                       continue
 
-              # Case 1: license findings (list of licenses with reference_matches)
-              if isinstance(data, list) and data and "license_expression" in data[0]:
-                  for lic in data:
-                      for ref in lic.get("reference_matches", []):
-                          licenses_rows.append({
-                              "file_path": ref.get("from_file"),
-                              "license_expression": lic.get("license_expression"),
-                              "license_expression_spdx": lic.get("license_expression_spdx"),
-                              "matched_text": ref.get("matched_text"),
-                              "start_line": ref.get("start_line"),
-                              "end_line": ref.get("end_line"),
-                              "rule_url": ref.get("rule_url"),
-                          })
-
-              # Case 2: file-by-file scan results
-              elif isinstance(data, dict) and "files" in data:
-                  for fi in data["files"]:
-                      files_rows.append({
-                          "path": fi.get("path"),
-                          "type": fi.get("type"),
-                          "licenses": "; ".join([
-                              str(lic.get("spdx_license_key",""))
-                              for lic in fi.get("licenses", [])
-                              if lic.get("spdx_license_key")
-                          ]),
-                          "copyrights": "; ".join([
-                              str(c.get("value",""))
-                              for c in fi.get("copyrights", [])
-                              if c.get("value")
-                          ]),
-                          "emails": "; ".join([
-                              str(e.get("value",""))
-                              for e in fi.get("emails", [])
-                              if e.get("value")
-                          ]),
-                          "urls": "; ".join([
-                              str(u.get("value",""))
-                              for u in fi.get("urls", [])
-                              if u.get("value")
-                          ]),
+              # ---- Licenses ----
+              for lic in data.get("license_detections", []):
+                  for ref in lic.get("reference_matches", []):
+                      lic_rows.append({
+                          "file": ref.get("from_file"),
+                          "spdx": lic.get("license_expression_spdx"),
+                          "expression": lic.get("license_expression"),
+                          "start": ref.get("start_line"),
+                          "end": ref.get("end_line"),
+                          "matcher": ref.get("matcher"),
+                          "score": ref.get("score"),
+                          "rule": ref.get("rule_identifier"),
+                          "rule_url": ref.get("rule_url"),
+                          "matched_text": ref.get("matched_text"),
                       })
 
-                      for p in fi.get("packages", []):
-                          packages_rows.append({
-                              "package_url": p.get("package_url"),
-                              "type": p.get("type"),
-                              "name": p.get("name"),
-                              "version": p.get("version"),
-                              "license_expression": p.get("license_expression"),
-                          })
+              # ---- Dependencies ----
+              for dep in data.get("dependencies", []):
+                  dep_rows.append({
+                      "purl": dep.get("purl"),
+                      "requirement": dep.get("extracted_requirement"),
+                      "scope": dep.get("scope"),
+                      "runtime": dep.get("is_runtime"),
+                      "optional": dep.get("is_optional"),
+                      "direct": dep.get("is_direct"),
+                      "datafile": dep.get("datafile_path"),
+                  })
 
-          # Convert to DataFrames
-          df_lic = pd.DataFrame(licenses_rows) if licenses_rows else pd.DataFrame()
-          df_files = pd.DataFrame(files_rows) if files_rows else pd.DataFrame()
-          df_pkg = pd.DataFrame(packages_rows) if packages_rows else pd.DataFrame()
+              # ---- Packages ----
+              for p in data.get("packages", []):
+                  pkg_rows.append({
+                      "purl": p.get("purl"),
+                      "type": p.get("type"),
+                      "name": p.get("name"),
+                      "version": p.get("version"),
+                      "declared_license": p.get("declared_license_expression"),
+                      "concluded_license": p.get("concluded_license_expression"),
+                  })
 
-          # --- Summaries for management view ---
+              # ---- Files (if present) ----
+              for fi in data.get("files", []):
+                  file_rows.append({
+                      "path": fi.get("path"),
+                      "type": fi.get("type"),
+                      "licenses": "; ".join([l.get("spdx_license_key","") for l in fi.get("licenses", [])]),
+                      "copyrights": "; ".join([c.get("value","") for c in fi.get("copyrights", [])]),
+                      "emails": "; ".join([e.get("value","") for e in fi.get("emails", [])]),
+                      "urls": "; ".join([u.get("value","") for u in fi.get("urls", [])]),
+                  })
+
+          # DataFrames
+          df_lic = pd.DataFrame(lic_rows)
+          df_dep = pd.DataFrame(dep_rows)
+          df_pkg = pd.DataFrame(pkg_rows)
+          df_files = pd.DataFrame(file_rows)
+
+          # ---- Summary Sheet ----
           summary_blocks = []
 
           if not df_lic.empty:
-              license_summary = df_lic.groupby("license_expression_spdx")["file_path"].count().reset_index()
-              license_summary.rename(columns={"file_path": "file_count"}, inplace=True)
-              license_summary.insert(0, "Category", "License Summary")
-              summary_blocks.append(license_summary)
+              lic_summary = df_lic.groupby("spdx")["file"].count().reset_index()
+              lic_summary.rename(columns={"file": "count"}, inplace=True)
+              lic_summary.insert(0, "Category", "Licenses")
+              summary_blocks.append(lic_summary)
 
-          if not df_files.empty:
-              copyright_summary = df_files[["path", "copyrights"]].copy()
-              copyright_summary.insert(0, "Category", "Copyrights")
-              summary_blocks.append(copyright_summary)
+          if not df_dep.empty:
+              dep_summary = df_dep[["purl", "scope", "requirement"]].copy()
+              dep_summary.insert(0, "Category", "Dependencies")
+              summary_blocks.append(dep_summary)
 
           if not df_pkg.empty:
-              pkg_summary = df_pkg[["type", "name", "version", "license_expression"]].copy()
+              pkg_summary = df_pkg[["type", "name", "version", "declared_license"]].copy()
               pkg_summary.insert(0, "Category", "Packages")
               summary_blocks.append(pkg_summary)
 
-          df_summary = pd.concat(summary_blocks, ignore_index=True) if summary_blocks else pd.DataFrame()
+          if not df_files.empty:
+              cpr_summary = df_files[["path", "copyrights"]].copy()
+              cpr_summary.insert(0, "Category", "Copyrights")
+              summary_blocks.append(cpr_summary)
 
-          # Output Excel named after repo/archive
+          df_summary = pd.concat(summary_blocks, ignore_index=True) if summary_blocks else pd.DataFrame([{"Category": "Info", "Message": "No data found"}])
+
+          # ---- Save Excel ----
           scan_label = os.getenv("SCAN_LABEL", "scancode")
           out_xlsx = f"scancode_{scan_label}.xlsx"
 
           with pd.ExcelWriter(out_xlsx) as w:
-              if not df_files.empty: df_files.to_excel(w, "Files_Detail", index=False)
               if not df_lic.empty: df_lic.to_excel(w, "Licenses_Detail", index=False)
-              if not df_pkg.empty: df_pkg.to_excel(w, "Packages", index=False)
-              if not df_summary.empty: df_summary.to_excel(w, "Summary", index=False)
+              if not df_dep.empty: df_dep.to_excel(w, "Dependencies_Detail", index=False)
+              if not df_pkg.empty: df_pkg.to_excel(w, "Packages_Detail", index=False)
+              if not df_files.empty: df_files.to_excel(w, "Files_Detail", index=False)
+              df_summary.to_excel(w, "Summary", index=False)
 
-              # 🔑 Ensure at least one sheet exists
-              if all(df.empty for df in [df_files, df_lic, df_pkg, df_summary]):
-                  pd.DataFrame([{"info": "No data extracted"}]).to_excel(
-                      w, sheet_name="Empty", index=False
-                  )
-
-          print(f"✅ Wrote Excel: {out_xlsx}")
+          print(f"✅ Excel written: {out_xlsx}")
           EOF
 
       - name: Upload ScanCode reports
