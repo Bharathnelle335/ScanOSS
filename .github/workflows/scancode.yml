@@ -4,18 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       scan_type:
-        description: "Scan type: docker | repo | zip"
+        description: "Scan type: repo | zip | docker"
         required: true
         default: "repo"
-      docker_image:
-        description: "Docker image (if scan_type=docker)"
-        default: "alpine:latest"
       repo_url:
         description: "Repo URL (if scan_type=repo)"
         default: "https://github.com/example/repo.git"
       archive_file:
         description: "Archive file (if scan_type=zip)"
         default: "sample.zip"
+      docker_image:
+        description: "Docker image (if scan_type=docker)"
+        default: "alpine:latest"
 
       enable_license_scan:
         type: boolean
@@ -55,9 +55,9 @@ jobs:
         run: |
           set -euo pipefail
           SCAN_TYPE="${{ github.event.inputs.scan_type }}"
-          DOCKER_IMAGE="${{ github.event.inputs.docker_image }}"
           REPO_URL="${{ github.event.inputs.repo_url }}"
           ARCHIVE_FILE="${{ github.event.inputs.archive_file }}"
+          DOCKER_IMAGE="${{ github.event.inputs.docker_image }}"
 
           case "$SCAN_TYPE" in
             repo)
@@ -65,16 +65,16 @@ jobs:
               git clone "$REPO_URL" input_repo
               INPUT_PATH="input_repo"
               ;;
+            zip)
+              echo "🗜️ Unzipping archive..."
+              unzip "$ARCHIVE_FILE" -d input_zip
+              INPUT_PATH="input_zip"
+              ;;
             docker)
               echo "🐳 Saving Docker image..."
               docker pull "$DOCKER_IMAGE"
               docker save "$DOCKER_IMAGE" -o docker-image.tar
               INPUT_PATH="docker-image.tar"
-              ;;
-            zip)
-              echo "🗜️ Unzipping archive..."
-              unzip "$ARCHIVE_FILE" -d input_zip
-              INPUT_PATH="input_zip"
               ;;
             *)
               echo "❌ Unknown scan_type: $SCAN_TYPE"
