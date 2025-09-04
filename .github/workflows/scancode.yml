@@ -90,8 +90,8 @@ jobs:
           cd scancode-toolkit
           ./scancode --version
 
-    - name: Run ScanCode Toolkit
-      run: |
+      - name: Run ScanCode Toolkit
+        run: |
           cd scancode-toolkit
           SCANCODE_OPTS=""
 
