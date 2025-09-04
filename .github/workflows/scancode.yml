@@ -119,63 +119,88 @@ jobs:
 
       - name: Convert JSON → CSV + Excel
         run: |
-          python3 - <<'EOF'
-          import pandas as pd, json, os, glob
+            python3 - <<'EOF'
+            import pandas as pd, json, glob
 
-          rows = []
+            licenses, files, packages = [], [], []
 
-          for json_file in glob.glob("*.json"):
-              with open(json_file, "r", encoding="utf-8") as f:
-                  try:
-                      data = json.load(f)
-                  except Exception:
-                      continue
+            for json_file in glob.glob("scancode_report*.json"):
+                with open(json_file, "r", encoding="utf-8") as f:
+                    try:
+                        data = json.load(f)
+                    except Exception:
+                        continue
 
-              # Case 1: license findings (like your sample)
-              if isinstance(data, list) and "license_expression" in str(data[0]):
-                  for lic in data:
-                      for ref in lic.get("reference_matches", []):
-                          rows.append({
-                              "file_path": ref.get("from_file"),
-                              "license_expression": lic.get("license_expression"),
-                              "license_expression_spdx": lic.get("license_expression_spdx"),
-                              "start_line": ref.get("start_line"),
-                              "end_line": ref.get("end_line"),
-                              "matcher": ref.get("matcher"),
-                              "score": ref.get("score"),
-                              "rule_identifier": ref.get("rule_identifier"),
-                              "rule_url": ref.get("rule_url"),
-                              "matched_text": ref.get("matched_text"),
-                          })
+                # Case 1: license findings (like your provided sample format)
+                if isinstance(data, list) and data and "license_expression" in data[0]:
+                    for lic in data:
+                        for ref in lic.get("reference_matches", []):
+                            licenses.append({
+                                "file_path": ref.get("from_file"),
+                                "license_expression": lic.get("license_expression"),
+                                "license_expression_spdx": lic.get("license_expression_spdx"),
+                                "matched_text": ref.get("matched_text"),
+                                "start_line": ref.get("start_line"),
+                                "end_line": ref.get("end_line"),
+                                "rule_url": ref.get("rule_url"),
+                            })
 
-              # Case 2: file-by-file scans
-              elif isinstance(data, dict) and "files" in data:
-                  for f in data["files"]:
-                      rows.append({
-                          "path": f.get("path"),
-                          "type": f.get("type"),
-                          "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
-                          "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
-                          "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]),
-                          "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]),
-                      })
+                # Case 2: file-by-file scans
+                elif isinstance(data, dict) and "files" in data:
+                    for f in data["files"]:
+                        files.append({
+                            "path": f.get("path"),
+                            "type": f.get("type"),
+                            "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
+                            "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
+                            "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]),
+                            "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]),
+                        })
+                        for p in f.get("packages", []):
+                            packages.append({
+                                "package_url": p.get("package_url"),
+                                "type": p.get("type"),
+                                "name": p.get("name"),
+                                "version": p.get("version"),
+                                "license_expression": p.get("license_expression"),
+                            })
 
-          if rows:
-              df = pd.DataFrame(rows)
-              df.to_csv("scancode_report.csv", index=False)
-              df.to_excel("scancode_report.xlsx", index=False)
-          else:
-              print("⚠️ No rows extracted from JSON")
-          EOF
+            # Convert to DataFrames
+            df_licenses = pd.DataFrame(licenses) if licenses else pd.DataFrame()
+            df_files = pd.DataFrame(files) if files else pd.DataFrame()
+            df_packages = pd.DataFrame(packages) if packages else pd.DataFrame()
 
+            # --- Summaries for management view ---
+            summary_blocks = []
 
-      - name: Upload ScanCode reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: scancode-reports
-          path: |
-            scancode_report.json
-            scancode_report.csv
-            scancode_report.xlsx
-            scancode_report.spdx.json
-            scancode_report.cdx.json
+            if not df_licenses.empty:
+                license_summary = df_licenses.groupby("license_expression_spdx")["file_path"].count().reset_index()
+                license_summary.rename(columns={"file_path": "file_count"}, inplace=True)
+                license_summary.insert(0, "Category", "License Summary")
+                summary_blocks.append(license_summary)
+
+            if not df_files.empty:
+                copyright_summary = df_files[["path", "copyrights"]].copy()
+                copyright_summary.insert(0, "Category", "Copyrights")
+                summary_blocks.append(copyright_summary)
+
+            if not df_packages.empty:
+                pkg_summary = df_packages[["type", "name", "version", "license_expression"]].copy()
+                pkg_summary.insert(0, "Category", "Packages")
+                summary_blocks.append(pkg_summary)
+
+            df_summary = pd.concat(summary_blocks, ignore_index=True) if summary_blocks else pd.DataFrame()
+
+            # Save Excel with detail + summary
+            with pd.ExcelWriter("scancode_report.xlsx") as writer:
+                if not df_licenses.empty:
+                    df_licenses.to_excel(writer, sheet_name="Licenses_Detail", index=False)
+                if not df_files.empty:
+                    df_files.to_excel(writer, sheet_name="Files_Detail", index=False)
+                if not df_packages.empty:
+                    df_packages.to_excel(writer, sheet_name="Packages", index=False)
+                if not df_summary.empty:
+                    df_summary.to_excel(writer, sheet_name="Summary", index=False)
+
+            print("✅ Excel created with detail + management summary")
+            EOF
