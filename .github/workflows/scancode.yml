@@ -4,18 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       scan_type:
-        description: "Scan type: repo | zip | docker"
-        required: true
-        default: "repo"
+        description: "Scan type"
+        type: choice
+        options:
+          - repo
+          - zip
+          - docker
+        default: repo
+
       repo_url:
         description: "Repo URL (if scan_type=repo)"
         default: "https://github.com/example/repo.git"
+
       archive_file:
         description: "Archive file (if scan_type=zip)"
         default: "sample.zip"
+
       docker_image:
         description: "Docker image (if scan_type=docker)"
-        default: "alpine:latest"
+        type: choice
+        options:
+          - alpine:latest
+          - python:3.12
+          - ubuntu:22.04
+          - node:20
+        default: alpine:latest
+
 
       enable_license_scan:
         type: boolean
