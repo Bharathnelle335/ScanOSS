@@ -61,20 +61,20 @@ jobs:
 
           case "$SCAN_TYPE" in
             repo)
-              echo "📂 Cloning repo..."
               git clone "$REPO_URL" input_repo
               INPUT_PATH="input_repo"
+              LABEL="$(basename "${REPO_URL%.*}")"
               ;;
             zip)
-              echo "🗜️ Unzipping archive..."
-              unzip "$ARCHIVE_FILE" -d input_zip
+              unzip -q "$ARCHIVE_FILE" -d input_zip
               INPUT_PATH="input_zip"
+              base="$(basename "$ARCHIVE_FILE")"; LABEL="${base%.*}"
               ;;
             docker)
-              echo "🐳 Saving Docker image..."
               docker pull "$DOCKER_IMAGE"
               docker save "$DOCKER_IMAGE" -o docker-image.tar
               INPUT_PATH="docker-image.tar"
+              LABEL="$(echo "$DOCKER_IMAGE" | tr '/:' '__')"
               ;;
             *)
               echo "❌ Unknown scan_type: $SCAN_TYPE"
@@ -83,6 +83,7 @@ jobs:
           esac
 
           echo "INPUT_PATH=$INPUT_PATH" >> $GITHUB_ENV
+          echo "SCAN_LABEL=$LABEL" >> $GITHUB_ENV
 
       - name: Download ScanCode Toolkit
         run: |
@@ -108,112 +109,114 @@ jobs:
             SCANCODE_OPTS="$SCANCODE_OPTS --package"
           fi
 
-          echo "⚡ Running ScanCode with options: $SCANCODE_OPTS"
-          ./scancode $SCANCODE_OPTS --json-pp ../scancode_report.json ../$INPUT_PATH
+          OUT_PREFIX="$GITHUB_WORKSPACE/scancode_${SCAN_LABEL}"
+          IN_PATH="$GITHUB_WORKSPACE/$INPUT_PATH"
+
+          ./scancode $SCANCODE_OPTS --json-pp "${OUT_PREFIX}.json" "$IN_PATH"
 
           if [ "${{ github.event.inputs.enable_sbom_export }}" = "true" ]; then
-          ./scancode --spdx-tv ../scancode_report.spdx.tv ../$INPUT_PATH
-          ./scancode --spdx-rdf ../scancode_report.spdx.rdf ../$INPUT_PATH
-          ./scancode --cyclonedx-json ../scancode_report.cdx.json ../$INPUT_PATH
+            ./scancode --spdx-tv   "${OUT_PREFIX}.spdx.tv"   "$IN_PATH"
+            ./scancode --spdx-rdf  "${OUT_PREFIX}.spdx.rdf"  "$IN_PATH"
+            ./scancode --cyclonedx-json "${OUT_PREFIX}.cdx.json" "$IN_PATH"
           fi
 
+          echo "OUT_PREFIX=$OUT_PREFIX" >> $GITHUB_ENV
 
-
-      - name: Convert JSON → CSV + Excel
+      - name: Convert JSON → Excel
         run: |
-            python3 - <<'EOF'
-            import pandas as pd, json, glob
+          python3 - <<'EOF'
+          import os, json, pandas as pd
+          ws = os.environ.get("GITHUB_WORKSPACE", ".")
+          label = os.environ.get("SCAN_LABEL", "report")
+          main_json = f"{ws}/scancode_{label}.json"
+          out_xlsx  = f"{ws}/scancode_{label}.xlsx"
 
-            licenses, files, packages = [], [], []
+          if not os.path.exists(main_json):
+              raise SystemExit("⚠️ No main JSON file found.")
 
-            for json_file in glob.glob("scancode_report*.json"):
-                with open(json_file, "r", encoding="utf-8") as f:
-                    try:
-                        data = json.load(f)
-                    except Exception:
-                        continue
+          with open(main_json, "r", encoding="utf-8") as f:
+              data = json.load(f)
 
-                # Case 1: license findings (like your provided sample format)
-                if isinstance(data, list) and data and "license_expression" in data[0]:
-                    for lic in data:
-                        for ref in lic.get("reference_matches", []):
-                            licenses.append({
-                                "file_path": ref.get("from_file"),
-                                "license_expression": lic.get("license_expression"),
-                                "license_expression_spdx": lic.get("license_expression_spdx"),
-                                "matched_text": ref.get("matched_text"),
-                                "start_line": ref.get("start_line"),
-                                "end_line": ref.get("end_line"),
-                                "rule_url": ref.get("rule_url"),
-                            })
+          files_rows, lic_rows, pkg_rows = [], [], []
 
-                # Case 2: file-by-file scans
-                elif isinstance(data, dict) and "files" in data:
-                    for f in data["files"]:
-                        files.append({
-                            "path": f.get("path"),
-                            "type": f.get("type"),
-                            "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
-                            "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
-                            "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]),
-                            "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]),
-                        })
-                        for p in f.get("packages", []):
-                            packages.append({
-                                "package_url": p.get("package_url"),
-                                "type": p.get("type"),
-                                "name": p.get("name"),
-                                "version": p.get("version"),
-                                "license_expression": p.get("license_expression"),
-                            })
+          if isinstance(data, dict) and "files" in data:
+              for fi in data["files"]:
+                  if fi.get("type") == "directory": continue
+                  lic_keys = [lic.get("spdx_license_key") for lic in fi.get("licenses", []) if lic.get("spdx_license_key")]
+                  if fi.get("detected_license_expression_spdx"):
+                      lic_keys.append(fi["detected_license_expression_spdx"])
+                  files_rows.append({
+                      "path": fi.get("path"),
+                      "type": fi.get("type"),
+                      "licenses": "; ".join(lic_keys),
+                      "copyrights": "; ".join([c.get("value") for c in fi.get("copyrights", [])]),
+                      "emails": "; ".join([e.get("value") for e in fi.get("emails", [])]),
+                      "urls": "; ".join([u.get("value") for u in fi.get("urls", [])]),
+                  })
+                  for p in fi.get("packages", []):
+                      pkg_rows.append({
+                          "package_url": p.get("package_url"),
+                          "type": p.get("type"),
+                          "name": p.get("name"),
+                          "version": p.get("version"),
+                          "license_expression": p.get("license_expression"),
+                      })
 
-            # Convert to DataFrames
-            df_licenses = pd.DataFrame(licenses) if licenses else pd.DataFrame()
-            df_files = pd.DataFrame(files) if files else pd.DataFrame()
-            df_packages = pd.DataFrame(packages) if packages else pd.DataFrame()
+          detections = data.get("license_detections") if isinstance(data, dict) else None
+          if detections:
+              for det in detections:
+                  expr = det.get("license_expression_spdx") or det.get("license_expression")
+                  for m in det.get("matches", []) + det.get("reference_matches", []):
+                      lic_rows.append({
+                          "file_path": m.get("from_file") or m.get("file_path"),
+                          "license_expression_spdx": expr,
+                          "start_line": m.get("start_line"),
+                          "end_line": m.get("end_line"),
+                          "matcher": m.get("matcher"),
+                          "score": m.get("score"),
+                          "rule_identifier": m.get("rule_identifier"),
+                          "rule_url": m.get("rule_url"),
+                          "matched_text": m.get("matched_text"),
+                      })
 
-            # --- Summaries for management view ---
-            summary_blocks = []
+          df_files = pd.DataFrame(files_rows)
+          df_lic   = pd.DataFrame(lic_rows)
+          df_pkg   = pd.DataFrame(pkg_rows)
 
-            if not df_licenses.empty:
-                license_summary = df_licenses.groupby("license_expression_spdx")["file_path"].count().reset_index()
-                license_summary.rename(columns={"file_path": "file_count"}, inplace=True)
-                license_summary.insert(0, "Category", "License Summary")
-                summary_blocks.append(license_summary)
+          summary_blocks = []
+          if not df_lic.empty:
+              lic_sum = df_lic.groupby("license_expression_spdx")["file_path"].nunique().reset_index()
+              lic_sum.rename(columns={"file_path":"file_count"}, inplace=True)
+              lic_sum.insert(0,"Category","License Summary")
+              summary_blocks.append(lic_sum)
+          if not df_files.empty and "copyrights" in df_files:
+              csum = df_files[df_files["copyrights"].astype(bool)][["path","copyrights"]]
+              if not csum.empty:
+                  csum = csum.copy()
+                  csum.insert(0,"Category","Copyrights")
+                  summary_blocks.append(csum)
+          if not df_pkg.empty:
+              pkg_sum = df_pkg[["type","name","version","license_expression"]].copy()
+              pkg_sum.insert(0,"Category","Packages")
+              summary_blocks.append(pkg_sum)
+          df_summary = pd.concat(summary_blocks, ignore_index=True) if summary_blocks else pd.DataFrame()
 
-            if not df_files.empty:
-                copyright_summary = df_files[["path", "copyrights"]].copy()
-                copyright_summary.insert(0, "Category", "Copyrights")
-                summary_blocks.append(copyright_summary)
+          with pd.ExcelWriter(out_xlsx) as w:
+              if not df_files.empty: df_files.to_excel(w, "Files_Detail", index=False)
+              if not df_lic.empty: df_lic.to_excel(w, "Licenses_Detail", index=False)
+              if not df_pkg.empty: df_pkg.to_excel(w, "Packages", index=False)
+              if not df_summary.empty: df_summary.to_excel(w, "Summary", index=False)
 
-            if not df_packages.empty:
-                pkg_summary = df_packages[["type", "name", "version", "license_expression"]].copy()
-                pkg_summary.insert(0, "Category", "Packages")
-                summary_blocks.append(pkg_summary)
+          print(f"✅ Wrote Excel: {out_xlsx}")
+          EOF
 
-            df_summary = pd.concat(summary_blocks, ignore_index=True) if summary_blocks else pd.DataFrame()
-
-            # Save Excel with detail + summary
-            with pd.ExcelWriter("scancode_report.xlsx") as writer:
-                if not df_licenses.empty:
-                    df_licenses.to_excel(writer, sheet_name="Licenses_Detail", index=False)
-                if not df_files.empty:
-                    df_files.to_excel(writer, sheet_name="Files_Detail", index=False)
-                if not df_packages.empty:
-                    df_packages.to_excel(writer, sheet_name="Packages", index=False)
-                if not df_summary.empty:
-                    df_summary.to_excel(writer, sheet_name="Summary", index=False)
-
-            print("✅ Excel created with detail + management summary")
-            EOF
-            
       - name: Upload ScanCode reports
         uses: actions/upload-artifact@v4
         with:
-          name: scancode-reports
+          name: scancode-reports-${{ env.SCAN_LABEL }}
           path: |
-            scancode_report.json
-            scancode_report.xlsx
-            scancode_report.spdx.tv
-            scancode_report.spdx.rdf
-            scancode_report.cdx.json
+            scancode_${{ env.SCAN_LABEL }}.json
+            scancode_${{ env.SCAN_LABEL }}.xlsx
+            scancode_${{ env.SCAN_LABEL }}.spdx.tv
+            scancode_${{ env.SCAN_LABEL }}.spdx.rdf
+            scancode_${{ env.SCAN_LABEL }}.cdx.json
