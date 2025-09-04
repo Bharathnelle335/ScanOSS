@@ -90,8 +90,8 @@ jobs:
           cd scancode-toolkit
           ./scancode --version
 
-      - name: Run ScanCode Toolkit
-        run: |
+    - name: Run ScanCode Toolkit
+      run: |
           cd scancode-toolkit
           SCANCODE_OPTS=""
 
@@ -109,11 +109,11 @@ jobs:
           fi
 
           echo "⚡ Running ScanCode with options: $SCANCODE_OPTS"
-          ./scancode $SCANCODE_OPTS --json-pp ../scancode_report.json $INPUT_PATH
+          ./scancode $SCANCODE_OPTS --json-pp ../scancode_report.json ../$INPUT_PATH
 
           if [ "${{ github.event.inputs.enable_sbom_export }}" = "true" ]; then
-            ./scancode --spdx-json-pp ../scancode_report.spdx.json $INPUT_PATH
-            ./scancode --cyclonedx-json ../scancode_report.cdx.json $INPUT_PATH
+            ./scancode --spdx-json-pp ../scancode_report.spdx.json ../$INPUT_PATH
+            ./scancode --cyclonedx-json ../scancode_report.cdx.json ../$INPUT_PATH
           fi
 
 
