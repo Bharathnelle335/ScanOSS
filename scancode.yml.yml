@@ -1,0 +1,178 @@
+name: ScanCode Toolkit Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: "Scan type: docker | repo | zip"
+        required: true
+        default: "repo"
+      docker_image:
+        description: "Docker image (if scan_type=docker)"
+        default: "alpine:latest"
+      repo_url:
+        description: "Repo URL (if scan_type=repo)"
+        default: "https://github.com/example/repo.git"
+      archive_file:
+        description: "Archive file (if scan_type=zip)"
+        default: "sample.zip"
+
+      # ===== Feature Toggles =====
+      enable_license:
+        type: boolean
+        description: "Detect licenses"
+        default: true
+      enable_license_text:
+        type: boolean
+        description: "Extract license texts"
+        default: false
+      enable_copyright:
+        type: boolean
+        description: "Detect copyright statements"
+        default: true
+      enable_author:
+        type: boolean
+        description: "Detect authors"
+        default: false
+      enable_email:
+        type: boolean
+        description: "Extract emails"
+        default: false
+      enable_url:
+        type: boolean
+        description: "Extract URLs"
+        default: false
+      enable_package:
+        type: boolean
+        description: "Detect packages and manifests"
+        default: true
+      enable_info:
+        type: boolean
+        description: "Collect file metadata (type, size, language)"
+        default: false
+      enable_spdx:
+        type: boolean
+        description: "Export SPDX JSON"
+        default: false
+      enable_cyclonedx:
+        type: boolean
+        description: "Export CycloneDX SBOM"
+        default: false
+
+jobs:
+  scancode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && \
+          sudo apt-get install -y git unzip docker.io jq python3 python3-pip && \
+          pip3 install pandas openpyxl
+
+      - name: Prepare input
+        run: |
+          set -euo pipefail
+          SCAN_TYPE="${{ github.event.inputs.scan_type }}"
+          DOCKER_IMAGE="${{ github.event.inputs.docker_image }}"
+          REPO_URL="${{ github.event.inputs.repo_url }}"
+          ARCHIVE_FILE="${{ github.event.inputs.archive_file }}"
+
+          case "$SCAN_TYPE" in
+            repo)
+              echo "📂 Cloning repo..."
+              git clone "$REPO_URL" input_repo
+              INPUT_PATH="input_repo"
+              ;;
+            docker)
+              echo "🐳 Saving Docker image..."
+              docker pull "$DOCKER_IMAGE"
+              docker save "$DOCKER_IMAGE" -o docker-image.tar
+              INPUT_PATH="docker-image.tar"
+              ;;
+            zip)
+              echo "🗜️ Unzipping archive..."
+              unzip "$ARCHIVE_FILE" -d input_zip
+              INPUT_PATH="input_zip"
+              ;;
+            *)
+              echo "❌ Unknown scan_type: $SCAN_TYPE"
+              exit 1
+              ;;
+          esac
+
+          echo "INPUT_PATH=$INPUT_PATH" >> $GITHUB_ENV
+
+      - name: Download ScanCode Toolkit
+        run: |
+          git clone --depth 1 https://github.com/nexB/scancode-toolkit.git
+          cd scancode-toolkit
+          ./scancode --version
+
+      - name: Run ScanCode Toolkit
+        run: |
+          cd scancode-toolkit
+          SCANCODE_OPTS=""
+          if [ "${{ github.event.inputs.enable_license }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --license"; fi
+          if [ "${{ github.event.inputs.enable_license_text }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --license-text"; fi
+          if [ "${{ github.event.inputs.enable_copyright }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --copyright"; fi
+          if [ "${{ github.event.inputs.enable_author }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --author"; fi
+          if [ "${{ github.event.inputs.enable_email }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --email"; fi
+          if [ "${{ github.event.inputs.enable_url }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --url"; fi
+          if [ "${{ github.event.inputs.enable_package }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --package"; fi
+          if [ "${{ github.event.inputs.enable_info }}" = "true" ]; then SCANCODE_OPTS="$SCANCODE_OPTS --info"; fi
+
+          echo "⚡ Running ScanCode with options: $SCANCODE_OPTS"
+          ./scancode $SCANCODE_OPTS --json-pp ../scancode_report.json $INPUT_PATH
+
+          # SPDX export
+          if [ "${{ github.event.inputs.enable_spdx }}" = "true" ]; then
+            ./scancode --spdx-json-pp ../scancode_report.spdx.json $INPUT_PATH
+          fi
+
+          # CycloneDX export
+          if [ "${{ github.event.inputs.enable_cyclonedx }}" = "true" ]; then
+            ./scancode --cyclonedx-json ../scancode_report.cdx.json $INPUT_PATH
+          fi
+
+      - name: Convert JSON → CSV + Excel
+        run: |
+          python3 - <<'EOF'
+          import pandas as pd, json
+
+          try:
+              with open("scancode_report.json", "r", encoding="utf-8") as f:
+                  data = json.load(f)
+          except FileNotFoundError:
+              print("No JSON report found")
+              exit(0)
+
+          rows = []
+          for f in data.get("files", []):
+              rows.append({
+                  "path": f.get("path"),
+                  "type": f.get("type"),
+                  "licenses": ", ".join([lic.get("spdx_license_key","") for lic in f.get("licenses", [])]),
+                  "copyrights": "; ".join([c.get("value","") for c in f.get("copyrights", [])]),
+                  "emails": "; ".join([e.get("value","") for e in f.get("emails", [])]) if "emails" in f else "",
+                  "urls": "; ".join([u.get("value","") for u in f.get("urls", [])]) if "urls" in f else "",
+              })
+
+          df = pd.DataFrame(rows)
+          if not df.empty:
+              df.to_csv("scancode_report.csv", index=False)
+              df.to_excel("scancode_report.xlsx", index=False)
+          EOF
+
+      - name: Upload ScanCode reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: scancode-reports
+          path: |
+            scancode_report.json
+            scancode_report.csv
+            scancode_report.xlsx
+            scancode_report.spdx.json
+            scancode_report.cdx.json
