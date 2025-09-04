@@ -99,7 +99,7 @@ jobs:
             SCANCODE_OPTS="$SCANCODE_OPTS --license --license-text"
           fi
           if [ "${{ github.event.inputs.enable_copyright_scan }}" = "true" ]; then
-            SCANCODE_OPTS="$SCANCODE_OPTS --copyright --author --email"
+            SCANCODE_OPTS="$SCANCODE_OPTS --copyright --email"
           fi
           if [ "${{ github.event.inputs.enable_metadata_scan }}" = "true" ]; then
             SCANCODE_OPTS="$SCANCODE_OPTS --url --info"
@@ -115,6 +115,7 @@ jobs:
             ./scancode --spdx-json-pp ../scancode_report.spdx.json $INPUT_PATH
             ./scancode --cyclonedx-json ../scancode_report.cdx.json $INPUT_PATH
           fi
+
 
       - name: Convert JSON → CSV + Excel
         run: |
