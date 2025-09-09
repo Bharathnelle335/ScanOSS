@@ -10,30 +10,18 @@ BRANCH = "main"             # update if different
 TOKEN = st.secrets.get("GITHUB_TOKEN", "")  # store PAT in Streamlit secrets
 
 headers = {
-    "Authorization": f"Bearer {TOKEN}",
+    "Authorization": f"Bearer {TOKEN}" if TOKEN else "",
     "Accept": "application/vnd.github+json"
 }
 
 # ---------------- Helpers ---------------- #
 def normalize_github_url_and_ref(url: str, ref_input: str):
-    """
-    Returns (normalized_git_url, resolved_ref, meta)
-    - Accepts:
-        https://github.com/<owner>/<repo>.git
-        https://github.com/<owner>/<repo>/tree/<ref>
-        https://github.com/<owner>/<repo>/commit/<sha>
-        https://github.com/<owner>/<repo>/releases/tag/<tag>
-      → converts to https://github.com/<owner>/<repo>.git and extracts <ref>.
-    - If ref_input is provided, it takes precedence after stripping refs/* prefixes.
-    """
     url = (url or "").strip()
     ref_in = (ref_input or "").strip()
-    # strip accidental full ref paths
     ref_in = ref_in.replace("refs/heads/", "").replace("refs/tags/", "")
 
     base_url = url
     detected_ref = ""
-
     if url.startswith("https://github.com/"):
         if "/tree/" in url:
             detected_ref = url.split("/tree/", 1)[1].split("/", 1)[0]
@@ -44,14 +32,38 @@ def normalize_github_url_and_ref(url: str, ref_input: str):
         elif "/releases/tag/" in url:
             detected_ref = url.split("/releases/tag/", 1)[1].split("/", 1)[0]
             base_url = url.split("/releases/tag/", 1)[0]
-        # ensure .git suffix
         if not base_url.endswith(".git"):
             base_url = base_url.rstrip("/") + ".git"
 
-    # resolved ref: explicit > detected > ""
     resolved_ref = ref_in or detected_ref or ""
-    meta = {"parsed_from_url": bool(detected_ref), "detected_ref": detected_ref, "normalized_url": base_url}
-    return base_url, resolved_ref, meta
+    return base_url, resolved_ref, {"parsed_from_url": bool(detected_ref), "detected_ref": detected_ref}
+
+def parse_owner_repo(url: str):
+    m = re.search(r"github\.com/([^/]+)/([^/\.]+)(?:\.git)?$", url.strip().rstrip("/"))
+    if not m:
+        # try without .git normalization
+        m = re.search(r"github\.com/([^/]+)/([^/]+)", url.strip())
+    if m:
+        return m.group(1), m.group(2).replace(".git","")
+    return None, None
+
+def gh_get(url: str):
+    h = {"Accept": "application/vnd.github+json"}
+    if TOKEN:
+        h["Authorization"] = f"Bearer {TOKEN}"
+    return requests.get(url, headers=h, timeout=30)
+
+def fetch_branches(owner: str, repo: str, per_page: int = 100):
+    r = gh_get(f"https://api.github.com/repos/{owner}/{repo}/branches?per_page={per_page}")
+    if r.ok:
+        return [b["name"] for b in r.json()]
+    return []
+
+def fetch_tags(owner: str, repo: str, per_page: int = 100):
+    r = gh_get(f"https://api.github.com/repos/{owner}/{repo}/tags?per_page={per_page}")
+    if r.ok:
+        return [t["name"] for t in r.json()]
+    return []
 
 # ---------------- UI ---------------- #
 st.title("🧩 ScanCode Toolkit Runner")
@@ -61,18 +73,53 @@ scan_type = st.selectbox("Select Scan Type", ["repo", "zip", "docker"], index=0)
 repo_url = st.text_input(
     "Repo URL (if scan_type = repo)",
     "https://github.com/psf/requests.git",
-    help="You can also paste web URLs like .../tree/<ref>, .../commit/<sha>, .../releases/tag/<tag>."
+    help="You can paste web URLs like …/tree/<ref>, …/commit/<sha>, …/releases/tag/<tag>."
 )
 
-# Optional git ref (only show for repo)
-git_ref_input = ""
+# ---------------- Refs picker (only for repo) ---------------- #
+if "git_ref_input" not in st.session_state:
+    st.session_state.git_ref_input = ""
+
 if scan_type == "repo":
+    # Normalize early to parse owner/repo
+    norm_url_preview, _, _ = normalize_github_url_and_ref(repo_url, "")
+    owner, repo_name = parse_owner_repo(norm_url_preview)
+
+    cols = st.columns([1,1,1])
+    with cols[0]:
+        load_refs = st.button("🔄 Load branches/tags", use_container_width=True)
+    with cols[1]:
+        pick_mode = st.radio("Pick ref from…", ["Tags", "Branches", "Manual"], horizontal=True, index=0)
+    with cols[2]:
+        st.caption("Tip: choose a tag/branch or type manually.")
+
+    if load_refs and owner and repo_name:
+        st.session_state._branches = fetch_branches(owner, repo_name)
+        st.session_state._tags = fetch_tags(owner, repo_name)
+    elif "_branches" not in st.session_state:
+        st.session_state._branches, st.session_state._tags = [], []
+
+    if pick_mode in ("Tags", "Branches"):
+        opts = st.session_state._tags if pick_mode == "Tags" else st.session_state._branches
+        if not opts:
+            st.warning("Click **Load branches/tags** to fetch refs from GitHub.")
+        else:
+            sel = st.selectbox(f"Select {pick_mode[:-1].lower()}",
+                               options=["-- choose --"] + opts,
+                               index=0,
+                               key=f"sel_{pick_mode.lower()}")
+            if sel != "-- choose --" and sel != st.session_state.git_ref_input:
+                st.session_state.git_ref_input = sel
+                st.rerun()
+
+    # Manual box (also shows current selection)
     git_ref_input = st.text_input(
-        "Git ref (branch / tag / commit) — optional",
-        "",
-        help="Examples: main, v1.2.3, 1a2b3c4. Leave empty if your URL already has /tree/<ref> or /releases/tag/<tag>."
+        "Git ref (branch / tag / commit)",
+        key="git_ref_input",
+        help="Examples: main, v1.2.3, 1a2b3c4. This will be sent as git_ref."
     )
-    # Live normalization preview
+
+    # Preview
     _norm_url, _resolved_ref, _meta = normalize_github_url_and_ref(repo_url, git_ref_input)
     with st.expander("🔎 Repo input normalization preview", expanded=False):
         st.write("**Repo URL (normalized):**", _norm_url or "(none)")
@@ -85,6 +132,7 @@ docker_image = st.text_input("Docker image (if scan_type = docker)", "alpine:lat
 
 st.markdown("### Select Scan Options")
 enable_license_scan = st.checkbox("License + License Text Detection", value=True)
+# rest unchanged …
 enable_copyright_scan = st.checkbox("Copyright + Author + Email Detection", value=True)
 enable_metadata_scan = st.checkbox("Metadata (URLs + File Info)", value=False)
 enable_package = st.checkbox("Package Detection", value=True)
@@ -92,10 +140,10 @@ enable_sbom_export = st.checkbox("Export SBOM (SPDX, CycloneDX)", value=False)
 
 # ---------------- ACTION ---------------- #
 if st.button("🚀 Start Scan"):
-    # Normalize Git inputs (only if repo)
+    # Normalize git bits if needed
     norm_repo_url, resolved_ref, _ = (repo_url, "", {})
     if scan_type == "repo":
-        norm_repo_url, resolved_ref, _ = normalize_github_url_and_ref(repo_url, git_ref_input)
+        norm_repo_url, resolved_ref, _ = normalize_github_url_and_ref(repo_url, st.session_state.git_ref_input)
 
     inputs = {
         "scan_type": scan_type,
@@ -103,12 +151,12 @@ if st.button("🚀 Start Scan"):
         "archive_file": archive_file,
         "docker_image": docker_image,
         "enable_license_scan": str(enable_license_scan).lower(),
-        "enable_copyright_scan": str(enable_copyright_scan).lower(),
         "enable_metadata_scan": str(enable_metadata_scan).lower(),
         "enable_package": str(enable_package).lower(),
         "enable_sbom_export": str(enable_sbom_export).lower(),
+        "enable_copyright_scan": str(enable_copyright_scan).lower(),
     }
-    # Only include git_ref if present (avoids 422 if workflow input not defined)
+    # Send git_ref only when present (avoids 422 if workflow lacks it)
     if scan_type == "repo" and resolved_ref:
         inputs["git_ref"] = resolved_ref
 
@@ -119,7 +167,6 @@ if st.button("🚀 Start Scan"):
     if resp.status_code == 204:
         st.success("✅ Scan started! It may take a few minutes.")
 
-        # --- Pretty summary ---
         st.markdown("### 🔧 Selected Scan Options")
         st.write(f"- **Scan Type:** {scan_type}")
         if scan_type == "repo":
@@ -132,10 +179,10 @@ if st.button("🚀 Start Scan"):
 
         st.markdown("**Enabled Scans**")
         st.write(f"- {'✅' if enable_license_scan else '❌'} License Detection")
-        st.write(f"- {'✅' if enable_copyright_scan else '❌'} Copyright")
         st.write(f"- {'✅' if enable_metadata_scan else '❌'} Metadata Scan")
         st.write(f"- {'✅' if enable_package else '❌'} Package Detection")
         st.write(f"- {'✅' if enable_sbom_export else '❌'} SBOM Export")
+        st.write(f"- {'✅' if enable_copyright_scan else '❌'} Copyright")
 
         st.markdown("### 📂 View Results")
         st.write(f"[🔗 GitHub Actions Page](https://github.com/{OWNER}/{REPO}/actions)")
