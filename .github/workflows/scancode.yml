@@ -1,4 +1,4 @@
-name: ScanCode Toolkit Scan
+name: ScanCode Toolkit Scan with tags input
 
 on:
   workflow_dispatch:
