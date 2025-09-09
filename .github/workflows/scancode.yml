@@ -22,6 +22,11 @@ on:
         description: "Repo URL (if scan_type=repo)"
         default: "https://github.com/psf/requests.git"
 
+      git_ref:   # NEW
+        description: "Branch / tag / commit to scan (leave blank if included in repo_url via /tree/<ref> or /releases/tag/<tag>)"
+        required: false
+        default: ""
+
       archive_file:
         description: "Archive file (if scan_type=zip)"
         default: "sample.zip"
@@ -61,30 +66,100 @@ jobs:
           pip3 install pandas openpyxl
 
       - name: Prepare input
+        shell: bash
         run: |
           set -euo pipefail
           SCAN_TYPE="${{ github.event.inputs.scan_type }}"
-          REPO_URL="${{ github.event.inputs.repo_url }}"
+          REPO_URL_RAW="${{ github.event.inputs.repo_url }}"
+          GIT_REF_RAW="${{ github.event.inputs.git_ref }}"
           ARCHIVE_FILE="${{ github.event.inputs.archive_file }}"
           DOCKER_IMAGE="${{ github.event.inputs.docker_image }}"
 
           case "$SCAN_TYPE" in
             repo)
-              git clone "$REPO_URL" input_repo
+              if [[ -z "${REPO_URL_RAW}" ]]; then
+                echo "❌ repo_url is required for scan_type=repo" >&2
+                exit 1
+              fi
+
+              # --- Normalize GitHub web URLs & extract ref if present ---
+              BASE_URL=""
+              DET_REF=""
+              case "$REPO_URL_RAW" in
+                https://github.com/*/tree/*)
+                  DET_REF="${REPO_URL_RAW##*/tree/}"
+                  BASE_URL="${REPO_URL_RAW%%/tree/*}.git"
+                  ;;
+                https://github.com/*/commit/*)
+                  DET_REF="${REPO_URL_RAW##*/commit/}"
+                  BASE_URL="${REPO_URL_RAW%%/commit/*}.git"
+                  ;;
+                https://github.com/*/releases/tag/*)
+                  DET_REF="${REPO_URL_RAW##*/releases/tag/}"
+                  BASE_URL="${REPO_URL_RAW%%/releases/tag/*}.git"
+                  ;;
+                https://github.com/*/*)
+                  BASE_URL="${REPO_URL_RAW%.git}.git"
+                  ;;
+                *)
+                  BASE_URL="${REPO_URL_RAW}"
+                  ;;
+              esac
+
+              # Strip refs/* prefixes if pasted
+              GIT_REF="${GIT_REF_RAW#refs/heads/}"
+              GIT_REF="${GIT_REF#refs/tags/}"
+
+              # Choose final ref: explicit > detected > main
+              if [[ -z "${GIT_REF}" ]]; then
+                if [[ -n "${DET_REF}" ]]; then
+                  GIT_REF="${DET_REF}"
+                else
+                  GIT_REF="main"
+                fi
+              fi
+
+              echo "🔧 Repo URL (normalized): ${BASE_URL}"
+              echo "🔧 Ref: ${GIT_REF}"
+
+              rm -rf input_repo
+
+              echo "🔎 Checking if '${GIT_REF}' is a branch/tag..."
+              if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
+                echo "✅ Found branch/tag. Shallow cloning…"
+                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" input_repo || true
+              fi
+
+              if [[ ! -d input_repo ]]; then
+                echo "ℹ️  Not a branch/tag (or shallow clone failed). Full clone + checkout…"
+                git clone "${BASE_URL}" input_repo
+                cd input_repo
+                git fetch --all --tags --prune
+                if ! git checkout --detach "${GIT_REF}"; then
+                  echo "❌ Ref '${GIT_REF}' not found in ${BASE_URL}" >&2
+                  echo "   Tip: use a branch (e.g., main), a tag (e.g., v1.2.3), or a commit SHA."
+                  exit 1
+                fi
+                cd -
+              fi
+
               INPUT_PATH="input_repo"
-              LABEL="$(basename "${REPO_URL%.*}")"
+              LABEL="$(basename "${BASE_URL%.*}")"
               ;;
+
             zip)
               unzip -q "$ARCHIVE_FILE" -d input_zip
               INPUT_PATH="input_zip"
               base="$(basename "$ARCHIVE_FILE")"; LABEL="${base%.*}"
               ;;
+
             docker)
               docker pull "$DOCKER_IMAGE"
               docker save "$DOCKER_IMAGE" -o docker-image.tar
               INPUT_PATH="docker-image.tar"
               LABEL="$(echo "$DOCKER_IMAGE" | tr '/:' '__')"
               ;;
+
             *)
               echo "❌ Unknown scan_type: $SCAN_TYPE"
               exit 1
@@ -156,7 +231,7 @@ jobs:
                           "end_line": ref.get("end_line"),
                           "score": ref.get("score"),
                           "rule_url": ref.get("rule_url"),
-                          "matched_text": ref.get("matched_text")[:200], # truncate long text
+                          "matched_text": (ref.get("matched_text") or "")[:200],
                       })
 
               # --- files (dynamic details) ---
@@ -205,10 +280,11 @@ jobs:
               summary_blocks.append(lic_summary)
 
           if not df_copy.empty:
-              copy_summary = df_copy.melt(id_vars=["file"], value_name="value").dropna()
-              copy_summary = copy_summary[["value","file"]]
-              copy_summary.insert(0,"Category","Copyrights/Authors/Emails")
-              summary_blocks.append(copy_summary)
+              # Flatten any columns named 'copyright', 'author', 'email' if present
+              dfc = df_copy.melt(id_vars=["file"], value_name="value").dropna()
+              dfc = dfc[["value","file"]]
+              dfc.insert(0,"Category","Copyrights/Authors/Emails")
+              summary_blocks.append(dfc)
 
           if not df_deps.empty:
               dep_summary = df_deps[["purl","requirement","scope"]].copy()
