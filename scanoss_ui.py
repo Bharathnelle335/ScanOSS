@@ -30,7 +30,21 @@ session.headers.update({
 OWNER = "Bharathnelle335"
 REPO = "scanOSS"
 
+# ---- GitHub paging helper ----
+def _next_link(headers: dict) -> str | None:
+    link = headers.get("Link")
+    if not link:
+        return None
+    for part in link.split(","):
+        seg = part.strip()
+        if 'rel="next"' in seg:
+            start = seg.find("<")
+            end = seg.find(">", start + 1)
+            if start != -1 and end != -1:
+                return seg[start + 1:end]
+    return None
 
+# ---- API helpers ----
 def dispatch_workflow(owner: str, repo: str, workflow_file: str, ref: str, inputs: dict):
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches"
     payload = {"ref": ref, "inputs": inputs}
@@ -58,23 +72,36 @@ def find_run_by_client_tag(runs: list, client_run_id: str):
     return None
 
 
-def list_branches_and_tags(owner: str, repo: str):
-    branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100"
-    tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
+def list_all_branches_and_tags(owner: str, repo: str):
     branches, tags = [], []
-    rb = session.get(branches_url, timeout=30)
-    rt = session.get(tags_url, timeout=30)
-    if rb.ok and isinstance(rb.json(), list):
-        branches = [b.get("name") for b in rb.json() if isinstance(b, dict) and b.get("name")]
-    if rt.ok and isinstance(rt.json(), list):
-        tags = [t.get("name") for t in rt.json() if isinstance(t, dict) and t.get("name")]
-    return branches, tags
+    url_b = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100"
+    while url_b:
+        rb = session.get(url_b, timeout=30)
+        if rb.ok and isinstance(rb.json(), list):
+            branches.extend([b.get("name") for b in rb.json() if isinstance(b, dict) and b.get("name")])
+        url_b = _next_link(rb.headers) if rb.ok else None
+
+    url_t = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
+    while url_t:
+        rt = session.get(url_t, timeout=30)
+        if rt.ok and isinstance(rt.json(), list):
+            tags.extend([t.get("name") for t in rt.json() if isinstance(t, dict) and t.get("name")])
+        url_t = _next_link(rt.headers) if rt.ok else None
+
+    # De-dup while preserving order
+    def _dedup(seq):
+        seen = set(); out = []
+        for s in seq:
+            if s not in seen:
+                out.append(s); seen.add(s)
+        return out
+    return _dedup(branches), _dedup(tags)
 
 # Persist refs between reruns
-if "__branches__" not in st.session_state:
-    st.session_state.__branches__ = []
-if "__tags__" not in st.session_state:
-    st.session_state.__tags__ = []
+st.session_state.setdefault("__branches__", [])
+st.session_state.setdefault("__tags__", [])
+st.session_state.setdefault("__branch_sel__", "")
+st.session_state.setdefault("__tag_sel__", "")
 
 # ----------------------- Main: Dispatch Inputs -----------------------
 st.subheader("Dispatch inputs")
@@ -110,32 +137,34 @@ elif scan_type in ("upload-zip", "upload-tar"):
         archive_url = samples[use_sample]
     archive_url = st.text_input("archive_url", value=archive_url)
 
-# ----------------------- GitHub Version (Ref) -----------------------
+# ----------------------- Ref selection (Branches & Tags) -----------------------
 st.markdown("---")
-st.subheader("GitHub version (ref)")
+ref_cols = st.columns([1, 1, 2])
+with ref_cols[0]:
+    if st.button("🔄 Load branches/tags"):
+        branches, tags = list_all_branches_and_tags(OWNER, REPO)
+        st.session_state.__branches__ = branches
+        st.session_state.__tags__ = tags
+        if not (branches or tags):
+            st.warning("No branches or tags found, or token missing access.")
 
-ref_help = f"Select a branch or tag from **{OWNER}/{REPO}** where `.github/workflows/{workflow_file}` exists."
-st.caption(ref_help)
+# Prepare dropdown options
+branches_options = [""] + (st.session_state.__branches__ or [])
+# Put 'main' to the top if present
+if "main" in branches_options:
+    branches_options = ["", "main"] + [b for b in branches_options if b not in ("", "main")]
 
-if st.button("🔄 Load branches/tags"):
-    branches, tags = list_branches_and_tags(OWNER, REPO)
-    st.session_state.__branches__ = branches
-    st.session_state.__tags__ = tags
-    if not (branches or tags):
-        st.warning("No branches or tags found, or token missing access.")
+tags_options = [""] + (st.session_state.__tags__ or [])
 
-# Build options: keep 'main' first, then branches, then tags, dedup while preserving order
-ref_options = []
-seen = set()
-for v in ["main", *st.session_state.__branches__, *st.session_state.__tags__]:
-    if v and v not in seen:
-        ref_options.append(v)
-        seen.add(v)
+# Two separate boxes
+ref_cols2 = st.columns(2)
+with ref_cols2[0]:
+    st.session_state.__branch_sel__ = st.selectbox("Branch", branches_options, index=0)
+with ref_cols2[1]:
+    st.session_state.__tag_sel__ = st.selectbox("Tag", tags_options, index=0)
 
-if not ref_options:
-    ref_options = ["main"]
-
-ref_choice = st.selectbox("Ref (branch or tag)", ref_options, index=0)
+# Final ref resolution: prefer selected branch, otherwise selected tag, otherwise 'main'
+ref_choice = st.session_state.__branch_sel__ or st.session_state.__tag_sel__ or "main"
 
 # ----------------------- Submit -----------------------
 col1, col2, _ = st.columns([1, 1, 3])
