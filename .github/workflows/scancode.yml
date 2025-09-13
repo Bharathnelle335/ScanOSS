@@ -1,7 +1,8 @@
-name: OSS Compliance - SCANOSS only (Docker, Git or Uploaded Source) with tags
+name: OSS Compliance - SCANOSS (Docker/Git/Upload) • manual or syft
 
 run-name: >-
   SCANOSS ${{ github.event.inputs.scan_type }} •
+  mode=${{ github.event.inputs.image_scan_mode }} •
   ${{ github.event.inputs.docker_image || github.event.inputs.git_url || github.event.inputs.archive_url || 'upload' }} •
   ${{ github.event.inputs.client_run_id }}
 
@@ -14,6 +15,13 @@ on:
         default: 'docker'
         type: choice
         options: [docker, git, upload-zip, upload-tar]
+
+      image_scan_mode:
+        description: 'How to scan container images (docker/export manual vs syft-driven)'
+        required: true
+        default: 'manual'
+        type: choice
+        options: [manual, syft]
 
       docker_image:
         description: 'Docker image name (e.g., nginx:latest) [scan_type: docker]'
@@ -48,8 +56,8 @@ jobs:
   oss-compliance:
     runs-on: ubuntu-latest
     env:
-      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}   # key added by you
-      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}   # optional; omit secret if not using a private endpoint
+      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}   # you added this
+      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}   # optional (omit if not using a private endpoint)
 
     steps:
       # -------------------------- Setup --------------------------
@@ -72,6 +80,13 @@ jobs:
           python3 -m pip install --user scanoss pandas openpyxl
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
+
+      - name: Install Syft (only if image_scan_mode == syft)
+        if: ${{ github.event.inputs.image_scan_mode == 'syft' }}
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b /usr/local/bin
+          syft version
 
       # -------- Normalize Docker image input (handles "alpine: latest") --------
       - name: Normalize Docker image input
@@ -249,36 +264,63 @@ jobs:
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"
           echo "🧾 Artifact base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
 
-      # -------------------- SCANOSS (no Syft) — single attempt --------------------
-      - name: Run SCANOSS scan (Docker, no Syft)
-        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' }}
+      # -------------------- SCANOSS (Docker) — choose mode --------------------
+      - name: Run SCANOSS scan on Docker image (manual export)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type == 'docker' &&
+          github.event.inputs.image_scan_mode == 'manual'
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p docker-output/extracted-rootfs
-          docker save "$DOCKER_IMAGE_REF" -o docker-output/image.tar
-          tar -xf docker-output/image.tar -C docker-output
-          find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
-          python3 -m scanoss.cli scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
+          mkdir -p docker-output/exported-rootfs
+          CID="$(docker create "$DOCKER_IMAGE_REF" /bin/true)"
+          docker export "$CID" -o docker-output/rootfs.tar
+          docker rm "$CID" >/dev/null
+          tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+          scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS scan (Auto-built image, no Syft)
+      - name: Run SCANOSS scan on Docker image (syft container-scan)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type == 'docker' &&
+          github.event.inputs.image_scan_mode == 'syft'
+        continue-on-error: true
+        run: |
+          scanoss-py container-scan "$DOCKER_IMAGE_REF" -o "scanoss_${SCAN_LABEL}.json"
+
+      # ------------- SCANOSS (Auto-built image for git/upload) --------------
+      - name: Run SCANOSS on auto-built image (manual export)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
           github.event.inputs.scan_type != 'docker' &&
-          steps.autodock.outputs.has_image == 'true'
+          steps.autodock.outputs.has_image == 'true' &&
+          github.event.inputs.image_scan_mode == 'manual'
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           IMG_REF="${{ steps.autodock.outputs.image_ref }}"
-          mkdir -p docker-output/extracted-rootfs
-          docker save "$IMG_REF" -o docker-output/image.tar
-          tar -xf docker-output/image.tar -C docker-output
-          find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
-          python3 -m scanoss.cli scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
+          mkdir -p docker-output/exported-rootfs
+          CID="$(docker create "$IMG_REF" /bin/true)"
+          docker export "$CID" -o docker-output/rootfs.tar
+          docker rm "$CID" >/dev/null
+          tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+          scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS scan (Directory)
+      - name: Run SCANOSS on auto-built image (syft container-scan)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type != 'docker' &&
+          steps.autodock.outputs.has_image == 'true' &&
+          github.event.inputs.image_scan_mode == 'syft'
+        continue-on-error: true
+        run: |
+          scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${SCAN_LABEL}.json"
+
+      # -------------------- SCANOSS (Directory) --------------------
+      - name: Run SCANOSS scan on directory (git/upload)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
           (
@@ -294,9 +336,9 @@ jobs:
           if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then TARGET_DIR="repo-to-scan"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
-          python3 -m scanoss.cli scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
+          scanoss-py scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
 
-      # ----------------------- (optional) Inspect JSON -----------------------
+      # ----------------------- Inspect SCANOSS JSON (debug) -----------------------
       - name: Inspect SCANOSS JSON (debug)
         shell: bash
         run: |
