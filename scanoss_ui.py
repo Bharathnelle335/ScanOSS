@@ -1,19 +1,31 @@
-import re
 import streamlit as st
 import requests
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+
+"""
+Streamlit UI to trigger your GitHub Actions workflow:
+  name: OSS Compliance - SCANOSS (Docker/Git/Upload) • manual or syft
+
+It calls the GitHub API `workflow_dispatch` with inputs that match your YAML.
+
+Setup (Streamlit secrets):
+- Add a file `.streamlit/secrets.toml` with:
+
+  GITHUB_TOKEN = "ghp_xxx..."   # PAT with repo/workflow scopes
+
+Run:
+  streamlit run scanoss_actions_ui.py
+"""
 
 st.set_page_config(page_title="SCANOSS Workflow Trigger", page_icon="🧩", layout="wide")
-
-# Header
-st.title("SCANOSS Workflow Trigger")
-st.caption("© EY Internal Use Only")
+st.title("🧩 SCANOSS Workflow Trigger (Docker / Git / Upload)")
 
 # ----------------------- Sidebar Config -----------------------
 with st.sidebar:
     st.header("Repo Config")
-    # Single field only (owner removed). Accepts either "owner/name" or just "name".
-    repo_input = st.text_input("Repository (owner/name or name)", value="Universal-OSS-Compliance")
+    owner = st.text_input("GitHub Owner", value="Bharathnelle335")
+    repo = st.text_input("Repository", value="Universal-OSS-Compliance")
     workflow_file = st.text_input("Workflow file name", value="scancode.yml")
     ref = st.text_input("Ref (branch/tag)", value="main")
 
@@ -32,23 +44,11 @@ session.headers.update({
     "X-GitHub-Api-Version": "2022-11-28",
 })
 
-DEFAULT_OWNER = "Bharathnelle335"  # owner input removed; fallback owner
-
-def owner_repo_from_repo_input(repo_input: str):
-    """Accepts 'owner/name' or 'name'. Returns (owner, name)."""
-    val = (repo_input or "").strip().strip("/")
-    if "/" in val:
-        o, n = val.split("/", 1)
-        return o.strip(), n.strip()
-    return DEFAULT_OWNER, val
-
-
 def dispatch_workflow(owner: str, repo: str, workflow_file: str, ref: str, inputs: dict):
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches"
     payload = {"ref": ref, "inputs": inputs}
     r = session.post(url, json=payload, timeout=60)
     return r
-
 
 def list_recent_runs(owner: str, repo: str, per_page: int = 20):
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
@@ -58,49 +58,16 @@ def list_recent_runs(owner: str, repo: str, per_page: int = 20):
         return r.json().get("workflow_runs", [])
     return []
 
-
 def find_run_by_client_tag(runs: list, client_run_id: str):
     client_run_id = (client_run_id or "").strip()
     if not client_run_id:
         return None
+    # Search by name contains client_run_id or display_title contains it
     for run in runs:
         name = run.get("name") or run.get("display_title") or ""
         if client_run_id in name:
             return run
     return None
-
-# --------- Git URL parsing + refs fetching ---------
-GITHUB_RE = re.compile(r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/#?]+)(?:\.git)?(?:/(?:tree|commit|releases/tag)/(?P<ref>[^/#?]+))?", re.I)
-
-def parse_git_url(url: str):
-    """Return (owner, repo, ref_hint) if URL matches, else (None,None,None)."""
-    if not url:
-        return None, None, None
-    m = GITHUB_RE.match(url.strip())
-    if not m:
-        # also accept 'owner/name'
-        if "/" in url and not url.startswith("http"):
-            owner, name = url.split("/", 1)
-            return owner, name, None
-        return None, None, None
-    return m.group("owner"), m.group("repo").removesuffix('.git'), m.group("ref")
-
-
-def fetch_refs(owner: str, repo: str, max_items: int = 100):
-    branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches"
-    tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags"
-    branches = []
-    tags = []
-    try:
-        rb = session.get(branches_url, params={"per_page": max_items}, timeout=60)
-        if rb.ok:
-            branches = [b.get("name") for b in rb.json() if isinstance(b, dict)]
-        rt = session.get(tags_url, params={"per_page": max_items}, timeout=60)
-        if rt.ok:
-            tags = [t.get("name") for t in rt.json() if isinstance(t, dict)]
-    except Exception:
-        pass
-    return branches, tags
 
 # ----------------------- Main Form -----------------------
 st.subheader("Dispatch inputs")
@@ -110,7 +77,7 @@ with colA:
     scan_type = st.selectbox("scan_type", ["docker", "git", "upload-zip", "upload-tar"], index=0)
     image_scan_mode = st.selectbox("image_scan_mode (for images)", ["manual", "syft"], index=0)
     enable_scanoss_bool = st.checkbox("enable_scanoss", value=True)
-    enable_scanoss = "true" if enable_scanoss_bool else "false"
+    enable_scanoss = "true" if enable_scanoss_bool else "false"  # strings, to match your YAML conditions
 
 with colB:
     client_run_id = st.text_input("client_run_id (optional tag)", value=datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
@@ -124,39 +91,8 @@ archive_url = ""
 if scan_type == "docker":
     docker_image = st.text_input("docker_image (e.g., nginx:latest)")
 elif scan_type == "git":
-    git_url = st.text_input("git_url (e.g., https://github.com/user/repo or user/repo or .../tree/v1.2.3)")
-
-    # Auto-detect branches/tags section
-    st.markdown("**Auto-detect branches/tags**")
-    ref_col1, ref_col2 = st.columns([1,1])
-    with ref_col1:
-        load_refs = st.button("🔄 Load branches/tags")
-    detected_ref_hint = None
-    owner_from_url, repo_from_url, ref_hint = parse_git_url(git_url)
-    if ref_hint:
-        detected_ref_hint = ref_hint
-
-    if load_refs and owner_from_url and repo_from_url:
-        branches, tags = fetch_refs(owner_from_url, repo_from_url)
-        st.session_state["__branches__"] = branches
-        st.session_state["__tags__"] = tags
-        st.success(f"Loaded {len(branches)} branches and {len(tags)} tags from {owner_from_url}/{repo_from_url}")
-
-    branches = st.session_state.get("__branches__", [])
-    tags = st.session_state.get("__tags__", [])
-
-    # Prefer branch selection first, then tag selection, then manual override
-    sel_branch = sel_tag = manual_ref = ""
-    if branches:
-        sel_branch = st.selectbox("Select branch", [""] + branches, index=0)
-    if tags:
-        sel_tag = st.selectbox("Select tag", [""] + tags, index=0)
-
-    manual_ref = st.text_input("Manual ref override (branch/tag/commit)", value=detected_ref_hint or "")
-
-    # Decide final git_ref priority: manual > selected branch > selected tag > empty
-    git_ref = manual_ref or sel_branch or sel_tag or ""
-
+    git_url = st.text_input("git_url (e.g., https://github.com/user/repo or .../tree/v1.2.3)")
+    git_ref = st.text_input("git_ref (optional if included in git_url)", value="")
 elif scan_type in ("upload-zip", "upload-tar"):
     st.caption("Provide a direct-download URL for the archive.")
     samples = {
@@ -179,6 +115,7 @@ with col2:
 status_box = st.empty()
 
 if go:
+    # Validate minimal required inputs by scan_type
     err = None
     if scan_type == "docker" and not docker_image:
         err = "docker_image is required for scan_type=docker"
@@ -190,7 +127,6 @@ if go:
     if err:
         status_box.error(err)
     else:
-        owner, repo = owner_repo_from_repo_input(repo_input)
         inputs = {
             "scan_type": scan_type,
             "image_scan_mode": image_scan_mode,
@@ -211,12 +147,12 @@ if go:
             status_box.error(f"❌ Exception while dispatching: {e}")
 
 if chk:
-    owner, repo = owner_repo_from_repo_input(repo_input)
     runs = list_recent_runs(owner, repo, per_page=30)
     run = find_run_by_client_tag(runs, client_run_id)
     if not run:
         st.info("No recent run found with this client_run_id in its run name. It may still be starting.")
     else:
+        rid = run.get("id")
         name = run.get("name") or run.get("display_title")
         status = run.get("status")
         conclusion = run.get("conclusion")
@@ -227,6 +163,7 @@ if chk:
         if html_url:
             st.markdown(f"➡️ [Open in GitHub]({html_url})")
 
+        # list artifacts for this run
         art_url = run.get("artifacts_url")
         if art_url:
             try:
@@ -237,6 +174,7 @@ if chk:
                         st.subheader("Artifacts")
                         for a in arts:
                             st.write(f"• **{a.get('name')}**  (size: {a.get('size_in_bytes')} bytes, expired: {a.get('expired')})")
+                            # GitHub does not give a public download link without auth; we can still provide the API link:
                             dl = a.get("archive_download_url")
                             if dl:
                                 st.code(dl, language="text")
