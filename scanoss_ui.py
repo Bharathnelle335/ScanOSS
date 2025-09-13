@@ -153,7 +153,8 @@ def new_client_tag() -> str:
 
 # ===================== SESSION STATE ===================== #
 for key, default in [
-    ("git_ref_input", ""),
+    ("git_ref_input", ""),                 # manual text box
+    ("git_ref_from_picker", ""),           # value chosen from tag/branch pickers (do NOT write into widget key)
     ("_branches", []),
     ("_tags", []),
     ("ref_picker_tag", "-- choose --"),
@@ -227,18 +228,21 @@ if scan_type == "git":
                 "Branch", ["-- choose --"] + (st.session_state.get("_branches") or []), index=0
             )
 
-        # If a tag is chosen, prefer it; else branch; else keep manual
+        # Prefer tag; else branch; store into a separate state key to avoid widget assignment error
         chosen_tag = st.session_state.get("ref_picker_tag")
         chosen_branch = st.session_state.get("ref_picker_branch")
         if chosen_tag and chosen_tag != "-- choose --":
-            st.session_state["git_ref_input"] = chosen_tag
+            st.session_state["git_ref_from_picker"] = chosen_tag
         elif chosen_branch and chosen_branch != "-- choose --":
-            st.session_state["git_ref_input"] = chosen_branch
+            st.session_state["git_ref_from_picker"] = chosen_branch
 
+    # Show effective ref without writing into the text_input widget key directly
+    effective_ref = st.session_state.get("git_ref_from_picker") or st.session_state.get("git_ref_input", "")
     _norm_url, _resolved_ref, _meta = normalize_github_url_and_ref(
-        st.session_state.get("source_input", ""), st.session_state.get("git_ref_input", "")
+        st.session_state.get("source_input", ""), effective_ref
     )
-    st.caption(f"🔧 Repo URL (normalized): {_norm_url or '(none)'} | Ref: {_resolved_ref or '(none)'}")
+    st.caption(f"🔧 Repo URL (normalized): {_norm_url or '(none)'} | Ref: {effective_ref or _resolved_ref or '(none)'}")
+ {_norm_url or '(none)'} | Ref: {_resolved_ref or '(none)'}")
 
 elif scan_type in ("upload-zip", "upload-tar"):
     c1, _ = st.columns([3, 2])
@@ -284,7 +288,7 @@ if run:
             "image_scan_mode": image_scan_mode,
             "docker_image": st.session_state.get("source_input") if scan_type == "docker" else "",
             "git_url": st.session_state.get("source_input") if scan_type == "git" else "",
-            "git_ref": st.session_state.get("git_ref_input") if scan_type == "git" else "",
+            "git_ref": (st.session_state.get("git_ref_from_picker") or st.session_state.get("git_ref_input")) if scan_type == "git" else "",
             "archive_url": st.session_state.get("source_input") if scan_type in ("upload-zip", "upload-tar") else "",
             "enable_scanoss": "true" if enable_scanoss_bool else "false",
             "client_run_id": client_run_id,
