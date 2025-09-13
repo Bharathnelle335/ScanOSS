@@ -1,4 +1,4 @@
-name: ScanCode Toolkit Scan (Repo / Folder / Zip / Tar / Docker)
+name: "ScanCode Toolkit Scan (Repo / Folder / Zip / Tar / Docker)"
 
 on:
   workflow_dispatch:
@@ -10,12 +10,13 @@ on:
         options: [repo, folder, zip, tar, docker]
         default: repo
 
+      # --- REPO / FOLDER ---
       repo_url:
         description: "Repo URL (for scan_type=repo or folder)"
         required: false
         default: "https://github.com/psf/requests.git"
       git_ref:
-        description: "Branch / tag / commit"
+        description: "Branch / tag / commit (optional; if blank and URL has /tree/<ref> or /releases/tag/<tag>, that wins)"
         required: false
         default: ""
       folder_path:
@@ -23,20 +24,23 @@ on:
         required: false
         default: ""
 
+      # --- ARCHIVES ---
       archive_url:
         description: "Download URL for .zip/.tar/.tar.gz (for scan_type=zip/tar)"
         required: false
         default: ""
       archive_file:
-        description: "Archive file in the repo workspace (for scan_type=zip)"
+        description: "Archive file in the repo workspace (for scan_type=zip) e.g., sample.zip"
         required: false
         default: "sample.zip"
 
+      # --- DOCKER ---
       docker_image:
         description: "Docker image (for scan_type=docker)"
         required: false
         default: "alpine:latest"
 
+      # --- SCANCODE TOGGLES ---
       enable_license_scan:
         type: boolean
         description: "Run license + license-text detection"
@@ -57,65 +61,3 @@ on:
         type: boolean
         description: "Export SPDX and CycloneDX SBOM"
         default: false
-
-jobs:
-  scancode:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout workflow repo
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y git unzip jq tar curl python3 python3-pip
-          pip3 install --no-input pandas openpyxl
-
-      - name: Prepare input
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SCAN_TYPE="${{ github.inputs.scan_type }}"
-          REPO_URL_RAW="${{ github.inputs.repo_url }}"
-          GIT_REF_RAW="${{ github.inputs.git_ref }}"
-          FOLDER_PATH="${{ github.inputs.folder_path }}"
-          ARCHIVE_URL="${{ github.inputs.archive_url }}"
-          ARCHIVE_FILE="${{ github.inputs.archive_file }}"
-          DOCKER_IMAGE="${{ github.inputs.docker_image }}"
-
-          normalize_repo_url() {
-            local raw="$1"
-            local base_url="" det_ref=""
-            case "$raw" in
-              https://github.com/*/tree/*)
-                det_ref="${raw##*/tree/}"; det_ref="${det_ref%%/*}"
-                base_url="${raw%%/tree/*}.git"
-                ;;
-              https://github.com/*/commit/*)
-                det_ref="${raw##*/commit/}"; det_ref="${det_ref%%/*}"
-                base_url="${raw%%/commit/*}.git"
-                ;;
-              https://github.com/*/releases/tag/*)
-                det_ref="${raw##*/releases/tag/}"; det_ref="${det_ref%%/*}"
-                base_url="${raw%%/releases/tag/*}.git"
-                ;;
-              https://github.com/*/*)
-                base_url="${raw%.git}.git"
-                ;;
-              *)
-                base_url="$raw"
-                ;;
-            esac
-            echo "$base_url|$det_ref"
-          }
-
-          strip_ref() {
-            local r="$1"
-            r="${r#refs/heads/}"; r="${r#refs/tags/}"
-            echo "$r"
-          }
-
-          # Scan type logic begins here...
