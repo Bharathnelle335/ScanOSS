@@ -184,8 +184,7 @@ with o2:
 with o3:
     enable_sbom_export = st.checkbox("Export SBOM", value=False, key="opt_sbom")
 with o4:
-    enable_copyright =
-    st.checkbox("Copyright/Author/Email", value=True, key="opt_copy")
+    enable_copyright = st.checkbox("Copyright/Author/Email", value=True, key="opt_copy")  # <-- fixed line
 
 # ===================== DISPATCH ===================== #
 run = st.button("🚀 Start Scan", use_container_width=True, type="primary")
