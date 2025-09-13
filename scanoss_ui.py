@@ -331,7 +331,8 @@ if check:
                 started = run.get("run_started_at")
                 html_url = run.get("html_url")
                 st.write(f"**Run:** [{run_id}]({html_url})")
-                st.write(f"**Status:** {status}  |  **Conclusion:** {conclusion or '—'}  |  **Started:** {started or '—'}")                if status != "completed":
+                st.write(f"**Status:** {status}  |  **Conclusion:** {conclusion or '—'}  |  **Started:** {started or '—'}")
+                if status != "completed":
                     st.info("⏳ Still running (queued/in_progress). Check again in a bit.")
                 else:
                     if conclusion and conclusion != "success":
