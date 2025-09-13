@@ -1,6 +1,6 @@
 name: OSS Compliance - SCANOSS (manual only) • docker/git/upload
 
-run-name: SCANOSS ${{ inputs.scan_type }} • ${{ inputs.docker_image || inputs.git_url || inputs.archive_url || 'upload' }} • ${{ inputs.client_run_id || github.run_id }}
+run-name: "SCANOSS ${{ inputs.scan_type }} • ${{ inputs.docker_image || inputs.git_url || inputs.archive_url || 'upload' }} • ${{ inputs.client_run_id || github.run_id }}"
 
 on:
   workflow_dispatch:
@@ -74,15 +74,14 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install --user scanoss pandas openpyxl
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
 
       # ---------------- Docker image normalization ----------------
       - name: Normalize Docker image
-        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        if: ${{ inputs.scan_type == 'docker' }}
         shell: bash
         run: |
           set -euo pipefail
-          RAW="${{ github.event.inputs.docker_image }}"
+          RAW="${{ inputs.docker_image }}"
           RAW_TRIM="$(echo "$RAW" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
           if [ -z "$RAW_TRIM" ]; then
             echo "❌ docker_image is required when scan_type=docker" >&2
@@ -97,15 +96,15 @@ jobs:
 
       # -------------------------- Prepare source --------------------------
       - name: Pull Docker image
-        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        if: ${{ inputs.scan_type == 'docker' }}
         run: docker pull "$DOCKER_IMAGE_REF"
 
       - name: Clone Git repository
-        if: ${{ github.event.inputs.scan_type == 'git' }}
+        if: ${{ inputs.scan_type == 'git' }}
         shell: bash
         run: |
           set -euo pipefail
-          RAW_URL="${{ github.event.inputs.git_url }}"; RAW_REF="${{ github.event.inputs.git_ref }}"
+          RAW_URL="${{ inputs.git_url }}"; RAW_REF="${{ inputs.git_ref }}"
           [ -z "$RAW_URL" ] && { echo "❌ git_url required"; exit 1; }
           BASE_URL=""; DET_REF=""
           case "$RAW_URL" in
@@ -132,12 +131,12 @@ jobs:
           echo "✔ HEAD: $(cd repo-to-scan && git rev-parse --short HEAD)"
 
       - name: Unzip uploaded source (or download ZIP)
-        if: ${{ github.event.inputs.scan_type == 'upload-zip' }}
+        if: ${{ inputs.scan_type == 'upload-zip' }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p uploaded-source
-          URL="${{ github.event.inputs.archive_url }}"
+          URL="${{ inputs.archive_url }}"
           if [ -n "$URL" ]; then
             echo "📥 Downloading ZIP from $URL"; curl -L --fail --retry 3 "$URL" -o input.zip
             unzip -q input.zip -d uploaded-source
@@ -146,12 +145,12 @@ jobs:
           fi
 
       - name: Extract uploaded TAR (or download TAR) with image-tar auto-detect
-        if: ${{ github.event.inputs.scan_type == 'upload-tar' }}
+        if: ${{ inputs.scan_type == 'upload-tar' }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p uploaded-tar
-          URL="${{ github.event.inputs.archive_url }}"
+          URL="${{ inputs.archive_url }}"
           if [ -n "$URL" ]; then
             echo "📥 Downloading TAR from $URL"; curl -L --fail --retry 3 "$URL" -o input.tar
             SRC="input.tar"
@@ -161,7 +160,7 @@ jobs:
           fi
           TMPDIR="$(mktemp -d)"; tar -tf "$SRC" > "$TMPDIR/list.txt"
           if grep -q '^manifest.json$' "$TMPDIR/list.txt"; then
-            echo "🧩 Detected Docker image tar; loading via docker and exporting merged rootfs"
+            echo "🧩 Detected Docker image tar; loading via docker"
             docker load -i "$SRC" | tee "$TMPDIR/load.log" || true
             IMG_REF="$(awk -F': ' '/Loaded image:/{ref=$2} END{print ref}' "$TMPDIR/load.log")"
             if [ -z "$IMG_REF" ]; then
@@ -171,12 +170,7 @@ jobs:
               IMG_REF="upload-image:latest"
             fi
             echo "DOCKER_IMAGE_FROM_TAR=$IMG_REF" >> "$GITHUB_ENV"
-            mkdir -p docker-output/exported-rootfs
-            CID="$(docker create "$IMG_REF" /bin/true)"
-            docker export "$CID" -o docker-output/rootfs.tar
-            docker rm "$CID" >/dev/null
-            tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
-            echo "SCAN_DIR=docker-output/exported-rootfs" >> "$GITHUB_ENV"
+            echo "SCAN_DIR=docker-output/exported-rootfs" >> "$GITHUB_ENV"   # placeholder, not used in container-scan path
             echo "IS_IMAGE_TAR=true" >> "$GITHUB_ENV"
           else
             echo "📦 Regular source tar; extracting"
@@ -193,7 +187,7 @@ jobs:
       # -------- Auto-detect Dockerfile & optionally build image (git/upload) --------
       - name: Detect Dockerfile and optionally build
         id: autodock
-        if: ${{ github.event.inputs.scan_type != 'docker' }}
+        if: ${{ inputs.scan_type != 'docker' }}
         run: |
           set -e
           if [ "${{ env.IS_IMAGE_TAR }}" = "true" ]; then
@@ -202,9 +196,9 @@ jobs:
             exit 0
           fi
           SCAN_DIR="."
-          if [ "${{ github.event.inputs.scan_type }}" = "git" ]; then SCAN_DIR="repo-to-scan"; fi
-          if [ "${{ github.event.inputs.scan_type }}" = "upload-zip" ]; then SCAN_DIR="uploaded-source"; fi
-          if [ "${{ github.event.inputs.scan_type }}" = "upload-tar" ]; then SCAN_DIR="uploaded-tar"; fi
+          if [ "${{ inputs.scan_type }}" = "git" ]; then SCAN_DIR="repo-to-scan"; fi
+          if [ "${{ inputs.scan_type }}" = "upload-zip" ]; then SCAN_DIR="uploaded-source"; fi
+          if [ "${{ inputs.scan_type }}" = "upload-tar" ]; then SCAN_DIR="uploaded-tar"; fi
           echo "SCAN_DIR=$SCAN_DIR" >> "$GITHUB_ENV"
           DF_PATH=$(find "$SCAN_DIR" -type f -iname 'Dockerfile' | head -n 1 || true)
           if [ -n "$DF_PATH" ]; then
@@ -225,21 +219,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RUN_TAG_IN="${{ github.event.inputs.client_run_id }}"
+          RUN_TAG_IN="${{ inputs.client_run_id }}"
           [ -z "$RUN_TAG_IN" ] && RUN_TAG_IN="${GITHUB_RUN_ID}"
           SAN_RUN_TAG="$(echo "$RUN_TAG_IN" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
           [ -z "$SAN_RUN_TAG" ] && SAN_RUN_TAG="${GITHUB_RUN_ID}"
           SAN_RUN_TAG="${SAN_RUN_TAG:0:80}"
-
-          MODE="${{ github.event.inputs.scan_type }}"
+          MODE="${{ inputs.scan_type }}"
           RAW=""
           if [ "$MODE" = "docker" ]; then
-            RAW="${DOCKER_IMAGE_REF:-${{ github.event.inputs.docker_image }}}"
+            RAW="${DOCKER_IMAGE_REF:-${{ inputs.docker_image }}}"
           elif [ "$MODE" = "git" ]; then
-            RAW="${{ github.event.inputs.git_url }}"
+            RAW="${{ inputs.git_url }}"
           elif [ "$MODE" = "upload-zip" ] || [ "$MODE" = "upload-tar" ]; then
-            if [ -n "${{ github.event.inputs.archive_url }}" ]; then
-              URL="${{ github.event.inputs.archive_url }}"; RAW="$(basename "${URL%%\?*}")"
+            if [ -n "${{ inputs.archive_url }}" ]; then
+              URL="${{ inputs.archive_url }}"; RAW="$(basename "${URL%%\?*}")"
             else
               FILE="$(ls input/* 2>/dev/null | head -n1 || true)"; RAW="$(basename "$FILE")"
             fi
@@ -250,7 +243,6 @@ jobs:
           SAN_LABEL="$(echo "$RAW" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
           [ -z "$SAN_LABEL" ] && SAN_LABEL="scan"
           SAN_LABEL="${SAN_LABEL:0:80}"
-
           echo "SCAN_LABEL=$SAN_LABEL" >> "$GITHUB_ENV"
           echo "RUN_TAG=$SAN_RUN_TAG"  >> "$GITHUB_ENV"
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"
@@ -258,15 +250,15 @@ jobs:
 
       # ---------------- Optional archive unpack (git/upload only) ----------------
       - name: Unpack nested archives (optional)
-        if: ${{ github.event.inputs.unpack_archives == 'true' && (github.event.inputs.scan_type == 'git' || github.event.inputs.scan_type == 'upload-zip' || (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) }}
+        if: ${{ inputs.unpack_archives == 'true' && (inputs.scan_type == 'git' || inputs.scan_type == 'upload-zip' || (inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) }}
         shell: bash
         run: |
           set -euo pipefail
           BASE_DIR="${SCAN_DIR:-}"
           if [ -z "$BASE_DIR" ]; then
-            if [ "${{ github.event.inputs.scan_type }}" = "git" ]; then BASE_DIR="repo-to-scan"; fi
-            if [ "${{ github.event.inputs.scan_type }}" = "upload-zip" ]; then BASE_DIR="uploaded-source"; fi
-            if [ "${{ github.event.inputs.scan_type }}" = "upload-tar" ]; then BASE_DIR="uploaded-tar"; fi
+            if [ "${{ inputs.scan_type }}" = "git" ]; then BASE_DIR="repo-to-scan"; fi
+            if [ "${{ inputs.scan_type }}" = "upload-zip" ]; then BASE_DIR="uploaded-source"; fi
+            if [ "${{ inputs.scan_type }}" = "upload-tar" ]; then BASE_DIR="uploaded-tar"; fi
           fi
           mkdir -p expanded
           rsync -a "$BASE_DIR"/ expanded/ || true
@@ -287,34 +279,17 @@ jobs:
           done
           echo "SCAN_DIR=expanded" >> "$GITHUB_ENV"
 
-      # ------------------------- SCANOSS (manual) -------------------------
-      - name: Run SCANOSS scan (Docker manual merged rootfs)
-        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p docker-output/exported-rootfs
-          CID="$(docker create "$DOCKER_IMAGE_REF" /bin/true)"
-          docker export "$CID" -o docker-output/rootfs.tar
-          docker rm "$CID" >/dev/null
-          tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
-          scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
+      # ------------------------- SCANOSS (Docker via container-scan) -------------------------
+      - name: Run SCANOSS scan (Docker image)
+        if: ${{ inputs.enable_scanoss == 'true' && inputs.scan_type == 'docker' }}
+        run: scanoss-py container-scan "$DOCKER_IMAGE_REF" -o "scanoss_${{ env.SCAN_LABEL }}.json"
 
       - name: Run SCANOSS scan (Auto-built image from git/upload)
-        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          IMG_REF="${{ steps.autodock.outputs.image_ref }}"
-          mkdir -p docker-output/exported-rootfs
-          CID="$(docker create "$IMG_REF" /bin/true)"
-          docker export "$CID" -o docker-output/rootfs.tar
-          docker rm "$CID" >/dev/null
-          tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
-          scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
+        if: ${{ inputs.enable_scanoss == 'true' && inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true' }}
+        run: scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${{ env.SCAN_LABEL }}.json"
 
       - name: Run SCANOSS scan (Directory: git/upload when no image built)
-        if: ${{ github.event.inputs.enable_scanoss == 'true' && (github.event.inputs.scan_type == 'git' || github.event.inputs.scan_type == 'upload-zip' || (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) && steps.autodock.outputs.has_image == 'false' }}
+        if: ${{ inputs.enable_scanoss == 'true' && (inputs.scan_type == 'git' || inputs.scan_type == 'upload-zip' || (inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) && steps.autodock.outputs.has_image == 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -332,9 +307,7 @@ jobs:
           out_json = f"scanoss_{scan_label}.json"
           xlsx_main  = f"{scan_label}_scanoss_components_report.xlsx"
           xlsx_merged= f"{scan_label}_compliance_merged_report.xlsx"
-
           files_rows, lic_rows, cr_rows = [], [], []
-
           def coalesce(*vals):
             for v in vals:
               if v not in (None, "", []): return v
@@ -342,11 +315,9 @@ jobs:
           def as_list(x):
             if x is None: return []
             return x if isinstance(x, list) else [x]
-
           if os.path.exists(out_json):
             with open(out_json, "r", encoding="utf-8") as f:
               data = json.load(f)
-
             def handle_file_entry(fpath, entry):
               comp = entry.get("component") or entry.get("name")
               ver  = entry.get("version")
@@ -396,7 +367,6 @@ jobs:
                 "id": entry.get("id"),
                 "match_count": len(as_list(entry.get("licenses"))) + len(as_list(entry.get("copyrights"))),
               })
-
             # Accept shapes: {"path":[findings]} OR dict with "files"/"identified" OR list
             if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()) and any("/" in k or k.startswith((".", "/")) or k == os.path.basename(k) for k in data.keys()):
               for fpath, lst in data.items():
@@ -417,11 +387,9 @@ jobs:
                       entries = entry.get("oss") if "oss" in entry and isinstance(entry["oss"], list) else [entry]
                       for e in entries:
                         if isinstance(e, dict): handle_file_entry(fpath, e)
-
           df_find = pd.DataFrame(files_rows)
           df_lic  = pd.DataFrame(lic_rows)
           df_cr   = pd.DataFrame(cr_rows)
-
           sums = []
           totals = pd.DataFrame([{
             "files_with_findings": int(df_find["file"].nunique()) if not df_find.empty else 0,
@@ -443,16 +411,13 @@ jobs:
                 top_lic.insert(0, "Category", "Top Licenses")
                 sums.append(top_lic.head(50))
           df_summary = pd.concat(sums, ignore_index=True)
-
           with pd.ExcelWriter(xlsx_main) as w:
             (df_find if not df_find.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Findings", index=False)
             if not df_lic.empty: df_lic.to_excel(w, "Licenses_Detail", index=False)
             if not df_cr.empty:  df_cr.to_excel(w, "Copyrights_Detail", index=False)
             df_summary.to_excel(w, "Summary", index=False)
-
           with pd.ExcelWriter(xlsx_merged) as w:
             (df_find if not df_find.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
-
           print(f"✅ XLSX written: {xlsx_main} / {xlsx_merged} • rows={len(df_find)}")
           PY
 
