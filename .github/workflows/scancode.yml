@@ -288,8 +288,10 @@ jobs:
         if: ${{ inputs.enable_scanoss == 'true' && inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true' }}
         run: scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${{ env.SCAN_LABEL }}.json"
 
-      - name: Run SCANOSS scan (Directory: git/upload when no image built)
-        if: ${{ inputs.enable_scanoss == 'true' && (inputs.scan_type == 'git' || inputs.scan_type == 'upload-zip' || (inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) && steps.autodock.outputs.has_image == 'false' }}
+      - name: "Run SCANOSS scan (Directory: git/upload when no image built)"
+        if: ${{ inputs.enable_scanoss == 'true'
+                && (inputs.scan_type == 'git' || inputs.scan_type == 'upload-zip' || inputs.scan_type == 'upload-tar')
+                && steps.autodock.outputs.has_image != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
