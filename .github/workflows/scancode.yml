@@ -48,10 +48,11 @@ jobs:
   oss-compliance:
     runs-on: ubuntu-latest
     env:
-      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}
-      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}
+      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}   # key added by you
+      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}   # optional; omit secret if not using a private endpoint
 
     steps:
+      # -------------------------- Setup --------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -72,7 +73,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
 
-      # ---------- Normalize Docker image (fixes "alpine: latest") ----------
+      # -------- Normalize Docker image input (handles "alpine: latest") --------
       - name: Normalize Docker image input
         if: ${{ github.event.inputs.scan_type == 'docker' }}
         shell: bash
@@ -104,6 +105,7 @@ jobs:
             echo "❌ git_url is required when scan_type=git" >&2
             exit 1
           fi
+
           BASE_URL=""; DET_REF=""
           case "$RAW_URL" in
             https://github.com/*/tree/*)
@@ -119,11 +121,15 @@ jobs:
               BASE_URL="${RAW_URL%.git}.git" ;;
             *) BASE_URL="${RAW_URL}" ;;
           esac
+
           GIT_REF="${RAW_REF#refs/heads/}"; GIT_REF="${GIT_REF#refs/tags/}"
           if [[ -z "${GIT_REF}" ]]; then
             if [[ -n "${DET_REF}" ]]; then GIT_REF="${DET_REF}"; else GIT_REF="main"; fi
           fi
-          echo "🔧 Repo: ${BASE_URL}"; echo "🔧 Ref:  ${GIT_REF}"
+
+          echo "🔧 Repo: ${BASE_URL}"
+          echo "🔧 Ref:  ${GIT_REF}"
+
           rm -rf repo-to-scan
           if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
             git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" repo-to-scan || true
@@ -188,6 +194,7 @@ jobs:
           if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then SCAN_DIR="repo-to-scan"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then SCAN_DIR="uploaded-source"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then SCAN_DIR="uploaded-tar"; fi
+
           HAS_IMAGE=false; IMAGE_REF=""
           DF_PATH=$(find "$SCAN_DIR" -type f -iname 'Dockerfile' | head -n 1 || true)
           if [[ -n "$DF_PATH" ]]; then
@@ -200,25 +207,23 @@ jobs:
           else
             echo "No Dockerfile – skip image build"
           fi
+
           echo "has_image=$HAS_IMAGE"  >> "$GITHUB_OUTPUT"
           echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
 
-      # --------------- Label + run tag for artifact names ---------------
+      # ---------------- Label + run tag (sanitize for artifact names) ----------------
       - name: Set LABEL and RUN_TAG env
         shell: bash
         run: |
           set -euo pipefail
-      
-          # ---- RUN_TAG: take client_run_id or fallback to GITHUB_RUN_ID, then SANITIZE ----
+          # RUN_TAG: client_run_id or GITHUB_RUN_ID, sanitized
           RUN_TAG_IN="${{ github.event.inputs.client_run_id }}"
           if [ -z "${RUN_TAG_IN}" ]; then RUN_TAG_IN="${GITHUB_RUN_ID}"; fi
-      
-          # Replace disallowed chars with '_' and keep only [A-Za-z0-9._-], max 80 chars
           SAN_RUN_TAG="$(echo "$RUN_TAG_IN" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
-          if [ -z "$SAN_RUN_TAG" ]; then SAN_RUN_TAG="${GITHUB_RUN_ID}"; fi
+          [ -z "$SAN_RUN_TAG" ] && SAN_RUN_TAG="${GITHUB_RUN_ID}"
           SAN_RUN_TAG="${SAN_RUN_TAG:0:80}"
-      
-          # ---- SCAN_LABEL: compute from source and sanitize (unchanged logic) ----
+
+          # SCAN_LABEL: from source
           MODE="${{ github.event.inputs.scan_type }}"
           RAW=""
           if [[ "$MODE" == "docker" ]]; then
@@ -231,22 +236,20 @@ jobs:
             else
               FILE="$(ls input/* 2>/dev/null | head -n1 || true)"; RAW="$(basename "$FILE")"
             fi
-            if [[ -z "$RAW" ]]; then RAW="$MODE"; fi
+            [ -z "$RAW" ] && RAW="$MODE"
           else
             RAW="scan"
           fi
           SAN_LABEL="$(echo "${RAW}" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
-          if [[ -z "$SAN_LABEL" ]]; then SAN_LABEL="scan"; fi
+          [ -z "$SAN_LABEL" ] && SAN_LABEL="scan"
           SAN_LABEL="${SAN_LABEL:0:80}"
-      
+
           echo "SCAN_LABEL=$SAN_LABEL" >> "$GITHUB_ENV"
           echo "RUN_TAG=$SAN_RUN_TAG"  >> "$GITHUB_ENV"
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"
-      
           echo "🧾 Artifact base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
 
-
-      # -------------------- SCANOSS (no Syft anywhere) --------------------
+      # -------------------- SCANOSS (no Syft) — single attempt --------------------
       - name: Run SCANOSS scan (Docker, no Syft)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' }}
         continue-on-error: true
@@ -257,7 +260,7 @@ jobs:
           docker save "$DOCKER_IMAGE_REF" -o docker-output/image.tar
           tar -xf docker-output/image.tar -C docker-output
           find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
-          scanoss-py scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
+          python3 -m scanoss.cli scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
       - name: Run SCANOSS scan (Auto-built image, no Syft)
         if: |
@@ -273,7 +276,7 @@ jobs:
           docker save "$IMG_REF" -o docker-output/image.tar
           tar -xf docker-output/image.tar -C docker-output
           find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
-          scanoss-py scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
+          python3 -m scanoss.cli scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
       - name: Run SCANOSS scan (Directory)
         if: |
@@ -291,9 +294,9 @@ jobs:
           if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then TARGET_DIR="repo-to-scan"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
-          scanoss-py scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
+          python3 -m scanoss.cli scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
 
-      # ----------------------- Debug SCANOSS JSON ------------------------
+      # ----------------------- (optional) Inspect JSON -----------------------
       - name: Inspect SCANOSS JSON (debug)
         shell: bash
         run: |
@@ -308,7 +311,7 @@ jobs:
             echo "JSON not found."
           fi
 
-      # ---------------- SCANOSS JSON ➜ Excel (always write) --------------
+      # ---------------- SCANOSS JSON ➜ Excel (always write) ----------------
       - name: Build SCANOSS Excel
         shell: bash
         run: |
@@ -319,69 +322,83 @@ jobs:
           out_json = f"scanoss_{scan_label}.json"
           xlsx_main  = f"{scan_label}_scanoss_components_report.xlsx"
           xlsx_merged= f"{scan_label}_compliance_merged_report.xlsx"
+
           rows = []
           if os.path.exists(out_json):
-              try:
-                  with open(out_json, "r", encoding="utf-8") as f:
-                      data = json.load(f)
-              except Exception as e:
-                  data = None
-              def add_row(file_path=None, component=None, version=None, license_=None, url=None, purl=None, vendor=None, extra=None):
+            try:
+              with open(out_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            except Exception as e:
+              data = None
+            def add_row(file_path=None, component=None, version=None, license_=None, url=None, purl=None, vendor=None, extra=None):
+              rows.append({
+                "file": file_path, "component": component, "version": version,
+                "license": license_, "url": url, "purl": purl, "vendor": vendor, "extra": extra
+              })
+            if isinstance(data, dict):
+              files = data.get("files") or data.get("identified") or []
+              if isinstance(files, list):
+                for f in files:
+                  fpath = f.get("file") or f.get("path")
+                  oss_lines = f.get("oss_lines") or f.get("oss") or []
+                  if isinstance(oss_lines, list):
+                    for line in oss_lines:
+                      dets = line.get("oss") if isinstance(line, dict) else None
+                      dets = dets if isinstance(dets, list) else ([line] if isinstance(line, dict) else [])
+                      for d in dets or []:
+                        if not isinstance(d, dict): continue
+                        keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
+                        add_row(fpath, d.get("component") or d.get("name"), d.get("version"),
+                                d.get("license") or d.get("licenses"),
+                                d.get("url") or d.get("homepage"), d.get("purl"), d.get("vendor"),
+                                json.dumps(keep, ensure_ascii=False) or None)
+              comps = data.get("components")
+              if isinstance(comps, list):
+                for d in comps:
+                  if not isinstance(d, dict): continue
+                  keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
                   rows.append({
-                      "file": file_path, "component": component, "version": version,
-                      "license": license_, "url": url, "purl": purl, "vendor": vendor, "extra": extra
+                    "file": None,
+                    "component": d.get("component") or d.get("name"),
+                    "version": d.get("version"),
+                    "license": d.get("license") or d.get("licenses"),
+                    "url": d.get("url") or d.get("homepage"),
+                    "purl": d.get("purl"),
+                    "vendor": d.get("vendor"),
+                    "extra": json.dumps(keep, ensure_ascii=False) or None
                   })
-              if isinstance(data, dict):
-                  files = data.get("files") or data.get("identified") or []
-                  if isinstance(files, list):
-                      for f in files:
-                          fpath = f.get("file") or f.get("path")
-                          oss_lines = f.get("oss_lines") or f.get("oss") or []
-                          if isinstance(oss_lines, list):
-                              for line in oss_lines:
-                                  dets = line.get("oss") if isinstance(line, dict) else None
-                                  dets = dets if isinstance(dets, list) else ([line] if isinstance(line, dict) else [])
-                                  for d in dets or []:
-                                      if not isinstance(d, dict): continue
-                                      keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
-                                      add_row(fpath, d.get("component") or d.get("name"), d.get("version"),
-                                              d.get("license") or d.get("licenses"),
-                                              d.get("url") or d.get("homepage"), d.get("purl"), d.get("vendor"),
-                                              json.dumps(keep, ensure_ascii=False) or None)
-                  comps = data.get("components")
-                  if isinstance(comps, list):
-                      for d in comps:
-                          if not isinstance(d, dict): continue
-                          keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
-                          add_row(None, d.get("component") or d.get("name"), d.get("version"),
-                                  d.get("license") or d.get("licenses"),
-                                  d.get("url") or d.get("homepage"), d.get("purl"), d.get("vendor"),
-                                  json.dumps(keep, ensure_ascii=False) or None)
-              elif isinstance(data, list):
-                  for f in data:
-                      if not isinstance(f, dict): continue
-                      fpath = f.get("file") or f.get("path")
-                      dets = f.get("oss") or f.get("components") or []
-                      if isinstance(dets, list):
-                          for d in dets:
-                              if not isinstance(d, dict): continue
-                              keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
-                              add_row(fpath, d.get("component") or d.get("name"), d.get("version"),
-                                      d.get("license") or d.get("licenses"),
-                                      d.get("url") or d.get("homepage"), d.get("purl"), d.get("vendor"),
-                                      json.dumps(keep, ensure_ascii=False) or None)
-          # Always write an Excel (even if no rows)
+            elif isinstance(data, list):
+              for f in data:
+                if not isinstance(f, dict): continue
+                fpath = f.get("file") or f.get("path")
+                dets = f.get("oss") or f.get("components") or []
+                if isinstance(dets, list):
+                  for d in dets:
+                    if not isinstance(d, dict): continue
+                    keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
+                    rows.append({
+                      "file": fpath,
+                      "component": d.get("component") or d.get("name"),
+                      "version": d.get("version"),
+                      "license": d.get("license") or d.get("licenses"),
+                      "url": d.get("url") or d.get("homepage"),
+                      "purl": d.get("purl"),
+                      "vendor": d.get("vendor"),
+                      "extra": json.dumps(keep, ensure_ascii=False) or None
+                    })
+
           df = pd.DataFrame(rows)
           with pd.ExcelWriter(xlsx_main) as w:
-              if not df.empty:
-                  df.to_excel(w, "SCANOSS_Components", index=False)
-              else:
-                  pd.DataFrame([{"status":"No detections","hint":"Try a larger repo/image or ensure SCANOSS_API_KEY is set if your tenant requires it."}]).to_excel(w, "Summary", index=False)
+            if not df.empty:
+              df.to_excel(w, "SCANOSS_Components", index=False)
+            else:
+              pd.DataFrame([{"status":"No detections or scan returned no results"}]).to_excel(w, "Summary", index=False)
           with pd.ExcelWriter(xlsx_merged) as w:
-              (df if not df.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
+            (df if not df.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
           print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
           PY
 
+      # -------------------------- Upload artifacts --------------------------
       - name: Upload Compliance Artifacts
         uses: actions/upload-artifact@v4
         with:
