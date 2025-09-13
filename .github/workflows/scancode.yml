@@ -81,11 +81,29 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
 
       # ----------------------------------------------------
+      # Normalize Docker image (fixes "alpine: latest" etc.)
+      # ----------------------------------------------------
+      - name: Normalize Docker image input
+        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="${{ github.event.inputs.docker_image }}"
+          RAW_TRIM="$(echo "$RAW" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          IMG_REF="$(echo "$RAW_TRIM" | sed -E 's/[[:space:]]*:[[:space:]]*/:/g' | tr -d '\r')"
+          if ! echo "$IMG_REF" | grep -Eq '^[[:alnum:]][[:alnum:]._/-]*(:[[:alnum:]._-]+)?(@sha256:[a-f0-9]{64})?$'; then
+            echo "❌ Invalid docker image reference after normalization: '$IMG_REF'" >&2
+            exit 1
+          fi
+          echo "DOCKER_IMAGE_REF=$IMG_REF" >> "$GITHUB_ENV"
+          echo "✅ Using Docker image: $IMG_REF"
+
+      # ----------------------------------------------------
       # Prepare source
       # ----------------------------------------------------
       - name: Pull Docker image
         if: ${{ github.event.inputs.scan_type == 'docker' }}
-        run: docker pull "${{ github.event.inputs.docker_image }}"
+        run: docker pull "$DOCKER_IMAGE_REF"
 
       - name: Clone Git repository
         if: ${{ github.event.inputs.scan_type == 'git' }}
@@ -258,12 +276,11 @@ jobs:
           MODE="${{ github.event.inputs.scan_type }}"
           RAW=""
           if [[ "$MODE" == "docker" ]]; then
-            RAW="${{ github.event.inputs.docker_image }}"
+            RAW="${DOCKER_IMAGE_REF:-${{ github.event.inputs.docker_image }}}"
           elif [[ "$MODE" == "git" ]]; then
             RAW="${{ github.event.inputs.git_url }}"
           elif [[ "$MODE" == "upload-zip" || "$MODE" == "upload-tar" ]]; then
             if [[ -n "${{ github.event.inputs.archive_url }}" ]]; then
-              # derive name from URL basename (strip query)
               URL="${{ github.event.inputs.archive_url }}"
               RAW="$(basename "${URL%%\?*}")"
             else
@@ -274,6 +291,7 @@ jobs:
           else
             RAW="scan"
           fi
+
           SAN_LABEL="$(echo "${RAW}" | tr '/:@ ' '__' | tr -cd 'A-Za-z0-9._-')"
           if [[ -z "$SAN_LABEL" ]]; then SAN_LABEL="scan"; fi
           SAN_LABEL="${SAN_LABEL:0:80}"
@@ -291,9 +309,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          IMG_REF="${{ github.event.inputs.docker_image }}"
           mkdir -p docker-output/extracted-rootfs
-          docker save "$IMG_REF" -o docker-output/image.tar
+          docker save "$DOCKER_IMAGE_REF" -o docker-output/image.tar
           tar -xf docker-output/image.tar -C docker-output
           find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
           scanoss-py scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
