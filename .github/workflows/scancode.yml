@@ -208,8 +208,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+      
+          # ---- RUN_TAG: take client_run_id or fallback to GITHUB_RUN_ID, then SANITIZE ----
           RUN_TAG_IN="${{ github.event.inputs.client_run_id }}"
           if [ -z "${RUN_TAG_IN}" ]; then RUN_TAG_IN="${GITHUB_RUN_ID}"; fi
+      
+          # Replace disallowed chars with '_' and keep only [A-Za-z0-9._-], max 80 chars
+          SAN_RUN_TAG="$(echo "$RUN_TAG_IN" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
+          if [ -z "$SAN_RUN_TAG" ]; then SAN_RUN_TAG="${GITHUB_RUN_ID}"; fi
+          SAN_RUN_TAG="${SAN_RUN_TAG:0:80}"
+      
+          # ---- SCAN_LABEL: compute from source and sanitize (unchanged logic) ----
           MODE="${{ github.event.inputs.scan_type }}"
           RAW=""
           if [[ "$MODE" == "docker" ]]; then
@@ -226,12 +235,16 @@ jobs:
           else
             RAW="scan"
           fi
-          SAN_LABEL="$(echo "${RAW}" | tr '/:@ ' '__' | tr -cd 'A-Za-z0-9._-')"
+          SAN_LABEL="$(echo "${RAW}" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
           if [[ -z "$SAN_LABEL" ]]; then SAN_LABEL="scan"; fi
           SAN_LABEL="${SAN_LABEL:0:80}"
+      
           echo "SCAN_LABEL=$SAN_LABEL" >> "$GITHUB_ENV"
-          echo "RUN_TAG=$RUN_TAG_IN"   >> "$GITHUB_ENV"
+          echo "RUN_TAG=$SAN_RUN_TAG"  >> "$GITHUB_ENV"
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"
+      
+          echo "🧾 Artifact base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
+
 
       # -------------------- SCANOSS (no Syft anywhere) --------------------
       - name: Run SCANOSS scan (Docker, no Syft)
