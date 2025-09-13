@@ -7,12 +7,7 @@ on:
         description: "What to scan"
         required: true
         type: choice
-        options:
-          - repo
-          - folder
-          - zip
-          - tar
-          - docker
+        options: [repo, folder, zip, tar, docker]
         default: repo
 
       # --- REPO / FOLDER ---
@@ -105,14 +100,17 @@ jobs:
             case "$raw" in
               https://github.com/*/tree/*)
                 det_ref="${raw##*/tree/}"
+                det_ref="${det_ref%%/*}"
                 base_url="${raw%%/tree/*}.git"
                 ;;
               https://github.com/*/commit/*)
                 det_ref="${raw##*/commit/}"
+                det_ref="${det_ref%%/*}"
                 base_url="${raw%%/commit/*}.git"
                 ;;
               https://github.com/*/releases/tag/*)
                 det_ref="${raw##*/releases/tag/}"
+                det_ref="${det_ref%%/*}"
                 base_url="${raw%%/releases/tag/*}.git"
                 ;;
               https://github.com/*/*)
@@ -125,7 +123,6 @@ jobs:
             echo "$base_url|$det_ref"
           }
 
-          # strip refs/* prefixes if pasted
           strip_ref() {
             local r="$1"
             r="${r#refs/heads/}"; r="${r#refs/tags/}"
@@ -150,18 +147,19 @@ jobs:
 
               echo "🔧 Repo URL (normalized): ${BASE_URL}"
               echo "🔧 Ref: ${GIT_REF}"
-              rm -rf input_repo
+              rm -rf "input_repo"
 
-              echo "🔎 Checking if '${GIT_REF}' is a branch/tag…"
-              if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
+              echo "🔎 Checking if '${GIT_REF}' is a branch or tag…"
+              if git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/heads/${GIT_REF}" || \
+                 git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/tags/${GIT_REF}"; then
                 echo "✅ Found branch/tag. Shallow cloning…"
-                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" input_repo || true
+                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" "input_repo" || true
               fi
 
-              if [[ ! -d input_repo ]]; then
+              if [[ ! -d "input_repo" ]]; then
                 echo "ℹ️ Not a branch/tag (or shallow clone failed). Full clone + checkout…"
-                git clone "${BASE_URL}" input_repo
-                cd input_repo
+                git clone "${BASE_URL}" "input_repo"
+                cd "input_repo"
                 git fetch --all --tags --prune
                 if ! git checkout --detach "${GIT_REF}"; then
                   echo "❌ Ref '${GIT_REF}' not found in ${BASE_URL}" >&2
@@ -196,18 +194,19 @@ jobs:
 
               echo "🔧 Repo URL (normalized): ${BASE_URL}"
               echo "🔧 Ref: ${GIT_REF}"
-              rm -rf input_repo
+              rm -rf "input_repo"
 
-              echo "🔎 Checking if '${GIT_REF}' is a branch/tag…"
-              if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
+              echo "🔎 Checking if '${GIT_REF}' is a branch or tag…"
+              if git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/heads/${GIT_REF}" || \
+                 git ls-remote --tags --heads "${BASE_URL}" | grep -Fq "refs/tags/${GIT_REF}"; then
                 echo "✅ Found branch/tag. Shallow cloning…"
-                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" input_repo || true
+                git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" "input_repo" || true
               fi
 
-              if [[ ! -d input_repo ]]; then
+              if [[ ! -d "input_repo" ]]; then
                 echo "ℹ️ Not a branch/tag (or shallow clone failed). Full clone + checkout…"
-                git clone "${BASE_URL}" input_repo
-                cd input_repo
+                git clone "${BASE_URL}" "input_repo"
+                cd "input_repo"
                 git fetch --all --tags --prune
                 if ! git checkout --detach "${GIT_REF}"; then
                   echo "❌ Ref '${GIT_REF}' not found in ${BASE_URL}" >&2
@@ -216,22 +215,26 @@ jobs:
                 cd -
               fi
 
-              if [[ ! -d "input_repo/$FOLDER_PATH" ]]; then
-                echo "❌ folder_path not found in repo: $FOLDER_PATH" >&2
+              # Securely resolve folder_path within repo
+              REPO_ROOT="$(cd "input_repo" && pwd)"
+              TARGET_PATH="$(cd "input_repo/$FOLDER_PATH" 2>/dev/null && pwd || true)"
+              if [[ -z "$TARGET_PATH" || "${TARGET_PATH}" != "${REPO_ROOT}"/* ]]; then
+                echo "❌ folder_path resolves outside repo or doesn't exist: $FOLDER_PATH" >&2
                 exit 1
               fi
-              INPUT_PATH="input_repo/$FOLDER_PATH"
+              INPUT_PATH="$TARGET_PATH"
               LABEL="$(basename "${BASE_URL%.*}")__$(echo "$FOLDER_PATH" | tr '/:' '__')"
-              ;;
+              ;|
 
             zip)
               # Prefer URL if provided; else try local archive_file in workspace
               if [[ -n "$ARCHIVE_URL" ]]; then
                 echo "📥 Downloading ZIP from $ARCHIVE_URL …"
-                curl -L "$ARCHIVE_URL" -o input.zip
-                unzip -q input.zip -d input_zip
+                curl -L --fail --retry 3 --retry-delay 2 "$ARCHIVE_URL" -o "input.zip"
+                unzip -q "input.zip" -d "input_zip"
                 INPUT_PATH="input_zip"
-                LABEL="$(basename "${ARCHIVE_URL%%\?*}" .zip)"
+                base="$(basename "${ARCHIVE_URL%%\?*}")"
+                LABEL="${base%.zip}"
               else
                 if [[ -z "$ARCHIVE_FILE" ]]; then
                   echo "❌ Provide archive_url or archive_file for scan_type=zip" >&2
@@ -241,7 +244,7 @@ jobs:
                   echo "❌ archive_file not found in workspace: $ARCHIVE_FILE" >&2
                   exit 1
                 fi
-                unzip -q "$ARCHIVE_FILE" -d input_zip
+                unzip -q "$ARCHIVE_FILE" -d "input_zip"
                 INPUT_PATH="input_zip"
                 base="$(basename "$ARCHIVE_FILE")"; LABEL="${base%.*}"
               fi
@@ -253,13 +256,15 @@ jobs:
                 exit 1
               fi
               echo "📥 Downloading TAR from $ARCHIVE_URL …"
-              curl -L "$ARCHIVE_URL" -o input.tar
-              mkdir -p input_tar
+              curl -L --fail --retry 3 --retry-delay 2 "$ARCHIVE_URL" -o "input.tar"
+              mkdir -p "input_tar"
               if [[ "$ARCHIVE_URL" == *.tar.gz ]] || [[ "$ARCHIVE_URL" == *.tgz ]]; then
-                tar -xzf input.tar -C input_tar
-                LABEL="$(basename "${ARCHIVE_URL%%\?*}" .tar.gz)"
+                tar -xzf "input.tar" -C "input_tar"
+                base="$(basename "${ARCHIVE_URL%%\?*}")"
+                base="${base%.tar.gz}"; base="${base%.tgz}"
+                LABEL="$base"
               else
-                tar -xf input.tar -C input_tar
+                tar -xf "input.tar" -C "input_tar"
                 LABEL="$(basename "${ARCHIVE_URL%%\?*}" .tar)"
               fi
               INPUT_PATH="input_tar"
@@ -271,7 +276,7 @@ jobs:
                 exit 1
               fi
               docker pull "$DOCKER_IMAGE"
-              docker save "$DOCKER_IMAGE" -o docker-image.tar
+              docker save "$DOCKER_IMAGE" -o "docker-image.tar"
               INPUT_PATH="docker-image.tar"
               LABEL="$(echo "$DOCKER_IMAGE" | tr '/:' '__')"
               ;;
@@ -282,8 +287,16 @@ jobs:
               ;;
           esac
 
+          # ---------- Sanitize label for safe filenames/artifacts ----------
+          RAW_LABEL="${LABEL:-scan}"
+          SAN_LABEL="$(echo "$RAW_LABEL" | tr -cd 'A-Za-z0-9._-')"
+          if [[ -z "$SAN_LABEL" ]]; then SAN_LABEL="scan"; fi
+          SAN_LABEL="${SAN_LABEL:0:80}"
+          echo "ℹ️  Raw label: $RAW_LABEL"
+          echo "ℹ️  Sanitized label: $SAN_LABEL"
+
           echo "INPUT_PATH=$INPUT_PATH" >> "$GITHUB_ENV"
-          echo "SCAN_LABEL=$LABEL" >> "$GITHUB_ENV"
+          echo "SCAN_LABEL=$SAN_LABEL" >> "$GITHUB_ENV"
 
       - name: Download ScanCode Toolkit
         shell: bash
@@ -442,6 +455,5 @@ jobs:
             scancode_${{ env.SCAN_LABEL }}.spdx.rdf
             scancode_${{ env.SCAN_LABEL }}.cdx.json
             scancode_${{ env.SCAN_LABEL }}_copyrights.csv
-          if-no-files-found: ignore   # tolerate disabled SBOM outputs
+          if-no-files-found: ignore
           # retention-days: 30
-          
