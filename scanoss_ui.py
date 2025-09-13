@@ -8,7 +8,7 @@ from datetime import datetime
 # ===================== CONFIG ===================== #
 OWNER = "Bharathnelle335"               # repo owner that hosts the workflow
 REPO = "scanOSS"                         # repo that holds the SCANOSS workflow
-WORKFLOW_FILE = "ScanOSS.yml"            # exact filename under .github/workflows/
+WORKFLOW_FILE = "Scanoss.yml"            # exact filename under .github/workflows/
 BRANCH = "main"                          # branch/tag where the workflow file exists
 TOKEN = st.secrets.get("GITHUB_TOKEN", "")  # PAT with repo + workflow scopes
 
