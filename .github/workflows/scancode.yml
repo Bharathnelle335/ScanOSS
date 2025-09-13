@@ -35,13 +35,13 @@ on:
         default: 'true'
         type: boolean
 
-      # NEW: remote archive URL support for upload-zip/upload-tar
+      # Optional: remote archive URL for upload-zip/upload-tar
       archive_url:
         description: 'Remote .zip or .tar(.gz|.xz) URL (used only when scan_type is upload-zip or upload-tar)'
         required: false
         default: ''
 
-      # Optional opaque tag from your UI so you can find this run/artifact later
+      # Optional opaque tag from the UI so you can find this run/artifact later
       client_run_id:
         description: 'Opaque run tag from the UI (for status + artifact lookup)'
         required: false
@@ -66,7 +66,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl unzip xz-utils
+          sudo apt-get install -y git curl unzip xz-utils tar
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -267,10 +267,10 @@ jobs:
               URL="${{ github.event.inputs.archive_url }}"
               RAW="$(basename "${URL%%\?*}")"
             else
-              # derive from uploaded file in input/
               FILE="$(ls input/* 2>/dev/null | head -n1 || true)"
               RAW="$(basename "$FILE")"
             fi
+            if [[ -z "$RAW" ]]; then RAW="$MODE"; fi
           else
             RAW="scan"
           fi
@@ -283,26 +283,36 @@ jobs:
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"   # backward-compat with previous naming
 
       # ----------------------------------------------------
-      # SCANOSS
+      # SCANOSS (no Syft anywhere)
       # ----------------------------------------------------
-      - name: Run SCANOSS scan (Docker with container-scan)
+      - name: Run SCANOSS scan (Docker, no Syft)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' }}
         continue-on-error: true
+        shell: bash
         run: |
           set -euo pipefail
           IMG_REF="${{ github.event.inputs.docker_image }}"
-          scanoss-py container-scan "$IMG_REF" -o "scanoss_${SCAN_LABEL}.json"
+          mkdir -p docker-output/extracted-rootfs
+          docker save "$IMG_REF" -o docker-output/image.tar
+          tar -xf docker-output/image.tar -C docker-output
+          find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
+          scanoss-py scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS scan (Auto-built image when available)
+      - name: Run SCANOSS scan (Auto-built image, no Syft)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
           github.event.inputs.scan_type != 'docker' &&
           steps.autodock.outputs.has_image == 'true'
         continue-on-error: true
+        shell: bash
         run: |
           set -euo pipefail
           IMG_REF="${{ steps.autodock.outputs.image_ref }}"
-          scanoss-py container-scan "$IMG_REF" -o "scanoss_${SCAN_LABEL}.json"
+          mkdir -p docker-output/extracted-rootfs
+          docker save "$IMG_REF" -o docker-output/image.tar
+          tar -xf docker-output/image.tar -C docker-output
+          find docker-output -name 'layer.tar' -print0 | xargs -0 -I{} tar -xf {} -C docker-output/extracted-rootfs
+          scanoss-py scan -d docker-output/extracted-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
       - name: Run SCANOSS scan (Directory)
         if: |
@@ -313,6 +323,7 @@ jobs:
             (github.event.inputs.scan_type == 'upload-tar' && steps.autodock.outputs.has_image == 'false')
           )
         continue-on-error: true
+        shell: bash
         run: |
           set -euo pipefail
           TARGET_DIR=""
