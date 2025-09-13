@@ -8,12 +8,12 @@ st.set_page_config(page_title="SCANOSS Workflow Trigger", page_icon="🧩", layo
 st.title("🧩 SCANOSS Workflow Trigger")
 st.caption("© EY Internal Use Only")
 
-# ----------------------- Sidebar Config -----------------------
+# ----------------------- Sidebar: Workflow Config -----------------------
 with st.sidebar:
     st.header("Workflow Config")
     workflow_file = st.text_input("Workflow file name", value="ScanOSS.yml")
     st.markdown("---")
-    st.caption("Auth: uses `st.secrets['GITHUB_TOKEN']`. Create a classic PAT with repo/workflow access.")
+    st.caption("Auth: uses `st.secrets['GITHUB_TOKEN']`. Create a classic PAT with repo + workflow scopes.")
 
 # ----------------------- Helpers -----------------------
 TOKEN = st.secrets.get("GITHUB_TOKEN", "")
@@ -30,11 +30,13 @@ session.headers.update({
 OWNER = "Bharathnelle335"
 REPO = "scanOSS"
 
+
 def dispatch_workflow(owner: str, repo: str, workflow_file: str, ref: str, inputs: dict):
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches"
     payload = {"ref": ref, "inputs": inputs}
     r = session.post(url, json=payload, timeout=60)
     return r
+
 
 def list_recent_runs(owner: str, repo: str, per_page: int = 20):
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
@@ -43,6 +45,7 @@ def list_recent_runs(owner: str, repo: str, per_page: int = 20):
     if r.ok:
         return r.json().get("workflow_runs", [])
     return []
+
 
 def find_run_by_client_tag(runs: list, client_run_id: str):
     client_run_id = (client_run_id or "").strip()
@@ -54,29 +57,27 @@ def find_run_by_client_tag(runs: list, client_run_id: str):
             return run
     return None
 
+
 def list_branches_and_tags(owner: str, repo: str):
-    branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=50"
-    tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=50"
+    branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100"
+    tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
     branches, tags = [], []
     rb = session.get(branches_url, timeout=30)
     rt = session.get(tags_url, timeout=30)
-    if rb.ok:
-        branches = [b["name"] for b in rb.json()]
-    if rt.ok:
-        tags = [t["name"] for t in rt.json()]
+    if rb.ok and isinstance(rb.json(), list):
+        branches = [b.get("name") for b in rb.json() if isinstance(b, dict) and b.get("name")]
+    if rt.ok and isinstance(rt.json(), list):
+        tags = [t.get("name") for t in rt.json() if isinstance(t, dict) and t.get("name")]
     return branches, tags
 
-# ----------------------- Main Form -----------------------
+# Persist refs between reruns
+if "__branches__" not in st.session_state:
+    st.session_state.__branches__ = []
+if "__tags__" not in st.session_state:
+    st.session_state.__tags__ = []
+
+# ----------------------- Main: Dispatch Inputs -----------------------
 st.subheader("Dispatch inputs")
-
-# Git refs
-branches, tags = [], []
-if st.button("🔄 Load branches/tags"):
-    branches, tags = list_branches_and_tags(OWNER, REPO)
-    if not (branches or tags):
-        st.warning("No branches or tags found, or token missing access.")
-
-ref_choice = st.selectbox("Select branch/tag (ref)", ["main"] + branches + tags)
 
 colA, colB = st.columns(2)
 with colA:
@@ -84,12 +85,10 @@ with colA:
     image_scan_mode = st.selectbox("image_scan_mode (for images)", ["manual", "syft"], index=0)
     enable_scanoss_bool = st.checkbox("enable_scanoss", value=True)
     enable_scanoss = "true" if enable_scanoss_bool else "false"
-
 with colB:
-    client_run_id = st.text_input("client_run_id (optional tag)",
-                                  value=datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
+    client_run_id = st.text_input("client_run_id (optional tag)", value=datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
 
-# Conditional inputs
+# ----------------------- Conditional Inputs -----------------------
 docker_image = ""
 git_url = ""
 git_ref = ""
@@ -111,8 +110,35 @@ elif scan_type in ("upload-zip", "upload-tar"):
         archive_url = samples[use_sample]
     archive_url = st.text_input("archive_url", value=archive_url)
 
+# ----------------------- GitHub Version (Ref) -----------------------
+st.markdown("---")
+st.subheader("GitHub version (ref)")
+
+ref_help = f"Select a branch or tag from **{OWNER}/{REPO}** where `.github/workflows/{workflow_file}` exists."
+st.caption(ref_help)
+
+if st.button("🔄 Load branches/tags"):
+    branches, tags = list_branches_and_tags(OWNER, REPO)
+    st.session_state.__branches__ = branches
+    st.session_state.__tags__ = tags
+    if not (branches or tags):
+        st.warning("No branches or tags found, or token missing access.")
+
+# Build options: keep 'main' first, then branches, then tags, dedup while preserving order
+ref_options = []
+seen = set()
+for v in ["main", *st.session_state.__branches__, *st.session_state.__tags__]:
+    if v and v not in seen:
+        ref_options.append(v)
+        seen.add(v)
+
+if not ref_options:
+    ref_options = ["main"]
+
+ref_choice = st.selectbox("Ref (branch or tag)", ref_options, index=0)
+
 # ----------------------- Submit -----------------------
-col1, col2, col3 = st.columns([1,1,2])
+col1, col2, _ = st.columns([1, 1, 3])
 with col1:
     go = st.button("🚀 Dispatch Workflow")
 with col2:
@@ -186,3 +212,6 @@ if chk:
                     st.caption(f"Could not list artifacts: {ar.status_code}")
             except Exception as e:
                 st.caption(f"Artifacts lookup error: {e}")
+
+st.markdown("---")
+st.caption("Tip: For `upload-zip` or `upload-tar`, provide a direct-download URL. For GitHub repos, you can use `.../archive/refs/heads/main.zip` or `.tar.gz`.")
