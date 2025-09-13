@@ -84,6 +84,10 @@ jobs:
           set -euo pipefail
           RAW="${{ github.event.inputs.docker_image }}"
           RAW_TRIM="$(echo "$RAW" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          if [ -z "$RAW_TRIM" ]; then
+            echo "❌ docker_image is required when scan_type=docker" >&2
+            exit 1
+          fi
           IMG_REF="$(echo "$RAW_TRIM" | sed -E 's/[[:space:]]*:[[:space:]]*/:/g' | tr -d '\r')"
           if ! echo "$IMG_REF" | grep -Eq '^[[:alnum:]][[:alnum:]._/-]*(:[[:alnum:]._-]+)?(@sha256:[a-f0-9]{64})?$'; then
             echo "❌ Invalid docker image reference after normalization: '$IMG_REF'" >&2; exit 1
@@ -254,10 +258,7 @@ jobs:
 
       # ---------------- Optional archive unpack (git/upload only) ----------------
       - name: Unpack nested archives (optional)
-        if: |
-          github.event.inputs.unpack_archives == 'true' &&
-          (github.event.inputs.scan_type == 'git' || github.event.inputs.scan_type == 'upload-zip' ||
-           (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true'))
+        if: ${{ github.event.inputs.unpack_archives == 'true' && (github.event.inputs.scan_type == 'git' || github.event.inputs.scan_type == 'upload-zip' || (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -300,10 +301,7 @@ jobs:
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
       - name: Run SCANOSS scan (Auto-built image from git/upload)
-        if: |
-          github.event.inputs.enable_scanoss == 'true' &&
-          github.event.inputs.scan_type != 'docker' &&
-          steps.autodock.outputs.has_image == 'true'
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -316,14 +314,7 @@ jobs:
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
       - name: Run SCANOSS scan (Directory: git/upload when no image built)
-        if: |
-          github.event.inputs.enable_scanoss == 'true' &&
-          (
-            (github.event.inputs.scan_type == 'git') ||
-            (github.event.inputs.scan_type == 'upload-zip') ||
-            (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')
-          ) &&
-          steps.autodock.outputs.has_image == 'false'
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && (github.event.inputs.scan_type == 'git' || github.event.inputs.scan_type == 'upload-zip' || (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')) && steps.autodock.outputs.has_image == 'false' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -343,6 +334,7 @@ jobs:
           xlsx_merged= f"{scan_label}_compliance_merged_report.xlsx"
 
           files_rows, lic_rows, cr_rows = [], [], []
+
           def coalesce(*vals):
             for v in vals:
               if v not in (None, "", []): return v
