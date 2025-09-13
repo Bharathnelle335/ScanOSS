@@ -5,7 +5,7 @@ import streamlit as st
 # ===================== CONFIG ===================== #
 OWNER = "Bharathnelle335"                   # change if repo differs
 REPO = "ScanCode_Toolkit"                   # repo where workflow is stored
-WORKFLOW_FILE = "scancode_unified.yml"      # unified workflow filename
+WORKFLOW_FILE = "scancode.yml"      # unified workflow filename
 BRANCH = "main"                             # update if different
 TOKEN = st.secrets.get("GITHUB_TOKEN", "")  # store PAT in Streamlit secrets
 
