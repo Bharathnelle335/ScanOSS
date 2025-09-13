@@ -331,30 +331,33 @@ if check:
                 started = run.get("run_started_at")
                 html_url = run.get("html_url")
                 st.write(f"**Run:** [{run_id}]({html_url})")
-                st.write(f"**Status:** {status}  |  **Conclusion:** {conclusion or '—'}  |  **Started:** {started or '—'}")
-
-                arts_resp = get_run_artifacts(run_id)
-                if not arts_resp.ok:
-                    st.error(f"Failed to list artifacts: {arts_resp.status_code} {arts_resp.text}")
+                st.write(f"**Status:** {status}  |  **Conclusion:** {conclusion or '—'}  |  **Started:** {started or '—'}")                if status != "completed":
+                    st.info("⏳ Still running (queued/in_progress). Check again in a bit.")
                 else:
-                    artifacts = arts_resp.json().get("artifacts", [])
-                    if not artifacts:
-                        st.warning("No artifacts found for this run.")
+                    if conclusion and conclusion != "success":
+                        st.error("❌ Completed with non-success conclusion.")
+                    arts_resp = get_run_artifacts(run_id)
+                    if not arts_resp.ok:
+                        st.error(f"Failed to list artifacts: {arts_resp.status_code} {arts_resp.text}")
                     else:
-                        # Prefer artifact with tag in name; else the first
-                        art = None
-                        for a in artifacts:
-                            if result_tag in a.get("name", ""):
-                                art = a; break
-                        if not art:
-                            art = artifacts[0]
-                        st.write(f"**Artifact:** `{art.get('name')}`  •  size ~ {art.get('size_in_bytes', 0)} bytes")
-                        if not art.get("expired", False):
-                            data = download_artifact_zip(art["id"])
-                            if data:
-                                fname = f"{art.get('name','scanoss-results')}.zip"
-                                st.download_button("⬇️ Download ZIP", data=data, file_name=fname, mime="application/zip")
-                            else:
-                                st.error("Failed to download artifact zip (empty response).")
+                        artifacts = arts_resp.json().get("artifacts", [])
+                        if not artifacts:
+                            st.warning("No artifacts found for this run.")
                         else:
-                            st.error("Artifact expired (per repo retention). Re-run the scan.")
+                            # Prefer artifact with tag in name; else the first
+                            art = None
+                            for a in artifacts:
+                                if result_tag in a.get("name", ""):
+                                    art = a; break
+                            if not art:
+                                art = artifacts[0]
+                            st.write(f"**Artifact:** `{art.get('name')}`  •  size ~ {art.get('size_in_bytes', 0)} bytes")
+                            if not art.get("expired", False):
+                                data = download_artifact_zip(art["id"])
+                                if data:
+                                    fname = f"{art.get('name','scanoss-results')}.zip"
+                                    st.download_button("⬇️ Download ZIP", data=data, file_name=fname, mime="application/zip")
+                                else:
+                                    st.error("Failed to download artifact zip (empty response).")
+                            else:
+                                st.error("Artifact expired (per repo retention). Re-run the scan.")
