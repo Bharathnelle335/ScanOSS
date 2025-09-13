@@ -224,7 +224,7 @@ jobs:
               fi
               INPUT_PATH="$TARGET_PATH"
               LABEL="$(basename "${BASE_URL%.*}")__$(echo "$FOLDER_PATH" | tr '/:' '__')"
-              ;;
+              ;;   # <-- fixed: was ;|
 
             zip)
               # Prefer URL if provided; else try local archive_file in workspace
