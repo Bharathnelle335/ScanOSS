@@ -1,9 +1,6 @@
 name: OSS Compliance - SCANOSS (manual only) • docker/git/upload
 
-run-name: >-
-  SCANOSS ${{ github.event.inputs.scan_type }} •
-  ${{ github.event.inputs.docker_image || github.event.inputs.git_url || github.event.inputs.archive_url || 'upload' }} •
-  ${{ github.event.inputs.client_run_id }}
+run-name: SCANOSS ${{ inputs.scan_type }} • ${{ inputs.docker_image || inputs.git_url || inputs.archive_url || 'upload' }} • ${{ inputs.client_run_id || github.run_id }}
 
 on:
   workflow_dispatch:
