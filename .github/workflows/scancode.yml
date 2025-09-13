@@ -5,6 +5,7 @@ run-name: >-
   mode=${{ github.event.inputs.image_scan_mode }} •
   ${{ github.event.inputs.docker_image || github.event.inputs.git_url || github.event.inputs.archive_url || 'upload' }} •
   ${{ github.event.inputs.client_run_id }}
+
 on:
   workflow_dispatch:
     inputs:
@@ -67,6 +68,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y git curl unzip xz-utils tar
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -78,12 +80,14 @@ jobs:
           python3 -m pip install --user scanoss pandas openpyxl
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
+
       - name: Install Syft (only if image_scan_mode == syft)
         if: ${{ github.event.inputs.image_scan_mode == 'syft' }}
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
           | sh -s -- -b /usr/local/bin
           syft version
+
       # -------- Normalize Docker image input (handles "alpine: latest") --------
       - name: Normalize Docker image input
         if: ${{ github.event.inputs.scan_type == 'docker' }}
@@ -99,6 +103,7 @@ jobs:
           fi
           echo "DOCKER_IMAGE_REF=$IMG_REF" >> "$GITHUB_ENV"
           echo "✅ Using Docker image: $IMG_REF"
+
       # -------------------------- Prepare source --------------------------
       - name: Pull Docker image
         if: ${{ github.event.inputs.scan_type == 'docker' }}
@@ -148,6 +153,7 @@ jobs:
             cd -
           fi
           echo "✔ Checked out $(cd repo-to-scan && git rev-parse --short HEAD)"
+
       - name: Unzip uploaded source archive (or download ZIP)
         if: ${{ github.event.inputs.scan_type == 'upload-zip' }}
         shell: bash
@@ -162,6 +168,7 @@ jobs:
           else
             unzip -q input/*.zip -d uploaded-source
           fi
+
       - name: Extract uploaded TAR archive (or download TAR)
         if: ${{ github.event.inputs.scan_type == 'upload-tar' }}
         shell: bash
@@ -187,6 +194,7 @@ jobs:
             *.tar)           tar -xf  "$SRC" -C uploaded-tar ;;
             *)               echo "ℹ️ Unknown TAR extension; trying generic -xf"; tar -xf "$SRC" -C uploaded-tar ;;
           esac
+
       # ---- Auto-detect Dockerfile & optionally build an image (non-docker modes) ----
       - name: Detect Dockerfile and optionally build image
         id: autodock
@@ -211,6 +219,7 @@ jobs:
           fi
           echo "has_image=$HAS_IMAGE"  >> "$GITHUB_OUTPUT"
           echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
+
       # ---------------- Label + run tag (sanitize for artifact names) ----------------
       - name: Set LABEL and RUN_TAG env
         shell: bash
@@ -246,6 +255,7 @@ jobs:
           echo "RUN_TAG=$SAN_RUN_TAG"  >> "$GITHUB_ENV"
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"
           echo "🧾 Artifact base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
+
       # -------------------- SCANOSS (Docker) — choose mode --------------------
       - name: Run SCANOSS scan on Docker image (manual export)
         if: |
@@ -261,7 +271,10 @@ jobs:
           docker export "$CID" -o docker-output/rootfs.tar
           docker rm "$CID" >/dev/null
           tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+          # Ensure files/dirs are readable so scanoss-py won’t hit PermissionError
+          chmod -R a+rX docker-output/exported-rootfs || true
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
+
       - name: Run SCANOSS scan on Docker image (syft container-scan)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
@@ -270,6 +283,7 @@ jobs:
         continue-on-error: true
         run: |
           scanoss-py container-scan "$DOCKER_IMAGE_REF" -o "scanoss_${SCAN_LABEL}.json"
+
       # ------------- SCANOSS (Auto-built image for git/upload) --------------
       - name: Run SCANOSS on auto-built image (manual export)
         if: |
@@ -287,7 +301,10 @@ jobs:
           docker export "$CID" -o docker-output/rootfs.tar
           docker rm "$CID" >/dev/null
           tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+          # Ensure files/dirs are readable so scanoss-py won’t hit PermissionError
+          chmod -R a+rX docker-output/exported-rootfs || true
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
+
       - name: Run SCANOSS on auto-built image (syft container-scan)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
@@ -297,6 +314,7 @@ jobs:
         continue-on-error: true
         run: |
           scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${SCAN_LABEL}.json"
+
       # -------------------- SCANOSS (Directory) --------------------
       - name: Run SCANOSS scan on directory (git/upload)
         if: |
@@ -315,6 +333,7 @@ jobs:
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
           if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
           scanoss-py scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
+
       # ----------------------- Inspect SCANOSS JSON (debug) -----------------------
       - name: Inspect SCANOSS JSON (debug)
         shell: bash
@@ -329,6 +348,7 @@ jobs:
           else
             echo "JSON not found."
           fi
+
       # ---------------- SCANOSS JSON ➜ Excel (always write) ----------------
       - name: Build SCANOSS Excel
         shell: bash
@@ -413,6 +433,7 @@ jobs:
             (df if not df.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
           print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
           PY
+
       # -------------------------- Upload artifacts --------------------------
       - name: Upload Compliance Artifacts
         uses: actions/upload-artifact@v4
