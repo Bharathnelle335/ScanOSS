@@ -1,27 +1,28 @@
 import re
-import streamlit as st
 import requests
+import streamlit as st
 
-# ---------------- CONFIG ---------------- #
+# ===================== CONFIG ===================== #
 OWNER = "Bharathnelle335"                # change if repo differs
 REPO = "ScanCode_Toolkit"                # repo where workflow is stored
 WORKFLOW_FILE = "scancode.yml"           # must match filename in .github/workflows/
 BRANCH = "main"                          # update if different
 TOKEN = st.secrets.get("GITHUB_TOKEN", "")  # store PAT in Streamlit secrets
 
-headers = {
-    "Authorization": f"Bearer {TOKEN}" if TOKEN else "",
-    "Accept": "application/vnd.github+json"
+HEADERS = {
+    "Accept": "application/vnd.github+json",
+    **({"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}),
 }
 
 st.set_page_config(page_title="ScanCode Toolkit Runner", layout="wide")
 st.title("🧩 ScanCode Toolkit Runner")
 
 if not TOKEN:
-    st.warning("No GitHub token found. Add `GITHUB_TOKEN` to Streamlit secrets for higher rate limits and private repos.")
+    st.warning("No GitHub token found. Add `GITHUB_TOKEN` to Streamlit secrets for private repos and higher rate limits.")
 
-# ---------------- Helpers ---------------- #
+# ===================== HELPERS ===================== #
 def normalize_github_url_and_ref(url: str, ref_input: str):
+    """Normalize GH web URLs to .git and resolve ref from URL or explicit input."""
     url = (url or "").strip()
     ref_in = (ref_input or "").strip()
     ref_in = ref_in.replace("refs/heads/", "").replace("refs/tags/", "")
@@ -49,50 +50,69 @@ def parse_owner_repo(url: str):
     if not m:
         m = re.search(r"github\.com/([^/]+)/([^/]+)", url.strip())
     if m:
-        return m.group(1), m.group(2).replace(".git","")
+        return m.group(1), m.group(2).replace(".git", "")
     return None, None
 
 def gh_get(url: str):
-    h = {"Accept": "application/vnd.github+json"}
-    if TOKEN:
-        h["Authorization"] = f"Bearer {TOKEN}"
-    return requests.get(url, headers=h, timeout=30)
+    return requests.get(url, headers=HEADERS, timeout=30)
 
 def fetch_branches(owner: str, repo: str, per_page: int = 100):
     r = gh_get(f"https://api.github.com/repos/{owner}/{repo}/branches?per_page={per_page}")
-    if r.ok:
-        return [b["name"] for b in r.json()]
-    return []
+    return [b["name"] for b in r.json()] if r.ok else []
 
 def fetch_tags(owner: str, repo: str, per_page: int = 100):
     r = gh_get(f"https://api.github.com/repos/{owner}/{repo}/tags?per_page={per_page}")
-    if r.ok:
-        return [t["name"] for t in r.json()]
-    return []
+    return [t["name"] for t in r.json()] if r.ok else []
 
-# ---------------- UI: Top row (side-by-side inputs) ---------------- #
+# ===================== SESSION STATE (SAFE) ===================== #
+for key, default in [
+    ("git_ref_input", ""),
+    ("_branches", []),
+    ("_tags", []),
+    ("ref_picker", "-- choose --"),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+def set_ref_from_picker():
+    sel = st.session_state.get("ref_picker", "")
+    if sel and sel != "-- choose --":
+        # Update the text_input's value via session_state (safe)
+        st.session_state["git_ref_input"] = sel
+        # Callback automatically triggers a rerun
+
+# ===================== UI: SCAN TYPE ===================== #
 scan_type = st.selectbox("Select Scan Type", ["repo", "folder", "zip", "tar", "docker"], index=0)
 
-# state for ref input
-if "git_ref_input" not in st.session_state:
-    st.session_state.git_ref_input = ""
-
-# Build the side-by-side row(s) depending on scan_type
+# ===================== UI: SIDE-BY-SIDE INPUTS ===================== #
+# We keep fields aligned in columns per scan type.
 if scan_type in ("repo", "folder"):
     c1, c2, c3 = st.columns([3, 2, 2])
     with c1:
         repo_url = st.text_input(
             "Repo URL",
             "https://github.com/psf/requests.git",
+            key="repo_url_input",
             help="Supports web URLs like …/tree/<ref>, …/commit/<sha>, …/releases/tag/<tag>."
         )
     with c2:
-        git_ref_input = st.text_input("Git ref (branch/tag/commit)", key="git_ref_input", help="Examples: main, v1.2.3, 1a2b3c4")
+        # Uses session_state key so picker can update it
+        git_ref_input = st.text_input(
+            "Git ref (branch/tag/commit)",
+            key="git_ref_input",
+            help="Examples: main, v1.2.3, 1a2b3c4"
+        )
     with c3:
-        folder_path = st.text_input("Folder path (only for scan_type=folder)", "" if scan_type=="repo" else "src/")
+        folder_path = st.text_input(
+            "Folder path (only for scan_type=folder)",
+            "src/" if scan_type == "folder" else "",
+            key="folder_path_input",
+            disabled=(scan_type == "repo"),
+            help="Relative path inside the repo (e.g., src/)."
+        )
 
-    # Optional: Ref picker in an expander
-    norm_url_preview, _, _ = normalize_github_url_and_ref(repo_url, "")
+    # Optional: ref picker expander
+    norm_url_preview, _, _ = normalize_github_url_and_ref(st.session_state.get("repo_url_input", ""), "")
     owner, repo_name = parse_owner_repo(norm_url_preview)
     with st.expander("🔎 Pick ref (load tags/branches)", expanded=False):
         cols = st.columns([1, 1, 2])
@@ -100,68 +120,74 @@ if scan_type in ("repo", "folder"):
             load_refs = st.button("🔄 Load refs", use_container_width=True)
         with cols[1]:
             pick_mode = st.radio("From", ["Tags", "Branches", "Manual"], horizontal=True, index=0)
+
         if load_refs and owner and repo_name:
-            st.session_state._branches = fetch_branches(owner, repo_name)
-            st.session_state._tags = fetch_tags(owner, repo_name)
-        elif "_branches" not in st.session_state:
-            st.session_state._branches, st.session_state._tags = [], []
+            st.session_state["_branches"] = fetch_branches(owner, repo_name)
+            st.session_state["_tags"] = fetch_tags(owner, repo_name)
+
         if pick_mode in ("Tags", "Branches"):
-            opts = st.session_state._tags if pick_mode == "Tags" else st.session_state._branches
+            opts = st.session_state["_tags"] if pick_mode == "Tags" else st.session_state["_branches"]
             if not opts:
                 st.warning("Click **Load refs** to fetch from GitHub.")
             else:
-                sel = st.selectbox(f"Select {pick_mode[:-1].lower()}", options=["-- choose --"] + opts, index=0, key=f"sel_{pick_mode.lower()}")
-                if sel != "-- choose --" and sel != st.session_state.git_ref_input:
-                    st.session_state.git_ref_input = sel
-                    st.rerun()
+                st.selectbox(
+                    f"Select {pick_mode[:-1].lower()}",
+                    options=["-- choose --"] + opts,
+                    index=0,
+                    key="ref_picker",
+                    on_change=set_ref_from_picker,  # safely updates git_ref_input
+                )
+        else:
+            st.caption("Manual mode enabled — type directly in the Git ref box.")
 
-    # Preview normalization
-    _norm_url, _resolved_ref, _meta = normalize_github_url_and_ref(repo_url, st.session_state.git_ref_input)
+    # Preview normalization (compact)
+    _norm_url, _resolved_ref, _meta = normalize_github_url_and_ref(st.session_state.get("repo_url_input", ""), st.session_state.get("git_ref_input", ""))
     st.caption(f"🔧 Repo URL (normalized): {_norm_url or '(none)'} | Ref: {_resolved_ref or '(none)'}")
 
 elif scan_type == "zip":
     c1, c2 = st.columns([3, 2])
     with c1:
-        archive_url = st.text_input("Archive URL (.zip)", "", placeholder="https://example.com/build.zip")
+        archive_url = st.text_input("Archive URL (.zip)", "", placeholder="https://example.com/build.zip", key="archive_url_input")
     with c2:
-        archive_file = st.text_input("Archive file (workspace)", "sample.zip", help="Used if URL is empty")
+        archive_file = st.text_input("Archive file (workspace)", "sample.zip", help="Used if URL is empty", key="archive_file_input")
 
 elif scan_type == "tar":
     c1, _ = st.columns([3, 2])
     with c1:
-        archive_url = st.text_input("Archive URL (.tar/.tar.gz/.tgz)", "", placeholder="https://example.com/src.tar.gz")
+        archive_url = st.text_input("Archive URL (.tar/.tar.gz/.tgz)", "", placeholder="https://example.com/src.tar.gz", key="archive_url_input")
 
 elif scan_type == "docker":
     c1, _ = st.columns([3, 2])
     with c1:
-        docker_image = st.text_input("Docker image", "alpine:latest", placeholder="nginx:latest")
+        docker_image = st.text_input("Docker image", "alpine:latest", placeholder="nginx:latest", key="docker_image_input")
 
-# ---------------- UI: Options row (side-by-side checkboxes) ---------------- #
+# ===================== UI: OPTIONS (SIDE-BY-SIDE) ===================== #
 st.markdown("### Scan Options")
 o1, o2, o3, o4, o5 = st.columns(5)
 with o1:
-    enable_license_scan = st.checkbox("License + Text", value=True)
+    enable_license_scan = st.checkbox("License + Text", value=True, key="opt_license")
 with o2:
-    enable_metadata_scan = st.checkbox("Metadata (URLs/Info)", value=False)
+    enable_metadata_scan = st.checkbox("Metadata (URLs/Info)", value=False, key="opt_meta")
 with o3:
-    enable_package = st.checkbox("Package Detect", value=True)
+    enable_package = st.checkbox("Package Detect", value=True, key="opt_pkg")
 with o4:
-    enable_sbom_export = st.checkbox("Export SBOM", value=False)
+    enable_sbom_export = st.checkbox("Export SBOM", value=False, key="opt_sbom")
 with o5:
-    enable_copyright_scan = st.checkbox("Copyright/Author/Email", value=True)
+    enable_copyright_scan = st.checkbox("Copyright/Author/Email", value=True, key="opt_copy")
 
-# ---------------- ACTION ---------------- #
+# ===================== ACTION ===================== #
 run = st.button("🚀 Start Scan", use_container_width=True)
 if run:
-    # Build inputs for dispatch
+    # Build the inputs expected by the workflow
     inputs = {
         "scan_type": scan_type,
-        "enable_license_scan": str(enable_license_scan).lower(),
-        "enable_metadata_scan": str(enable_metadata_scan).lower(),
-        "enable_package": str(enable_package).lower(),
-        "enable_sbom_export": str(enable_sbom_export).lower(),
-        "enable_copyright_scan": str(enable_copyright_scan).lower(),
-        # include all keys expected by the workflow; blanks are fine
+        # toggles must be strings for workflow_dispatch inputs
+        "enable_license_scan": str(st.session_state["opt_license"]).lower(),
+        "enable_metadata_scan": str(st.session_state["opt_meta"]).lower(),
+        "enable_package": str(st.session_state["opt_pkg"]).lower(),
+        "enable_sbom_export": str(st.session_state["opt_sbom"]).lower(),
+        "enable_copyright_scan": str(st.session_state["opt_copy"]).lower(),
+        # always include all keys expected by YAML; blanks are fine
         "repo_url": "",
         "git_ref": "",
         "folder_path": "",
@@ -170,34 +196,36 @@ if run:
         "docker_image": "",
     }
 
-    valid = True
-    err = None
+    valid, err = True, None
 
     if scan_type in ("repo", "folder"):
-        norm_repo_url, resolved_ref, _ = normalize_github_url_and_ref(repo_url, st.session_state.git_ref_input)
+        repo_url_val = st.session_state.get("repo_url_input", "")
+        git_ref_val = st.session_state.get("git_ref_input", "")
+        norm_repo_url, resolved_ref, _ = normalize_github_url_and_ref(repo_url_val, git_ref_val)
         inputs["repo_url"] = norm_repo_url
         if resolved_ref:
             inputs["git_ref"] = resolved_ref
         if scan_type == "folder":
-            inputs["folder_path"] = folder_path.strip()
-            if not inputs["folder_path"]:
+            folder_path_val = (st.session_state.get("folder_path_input", "") or "").strip()
+            inputs["folder_path"] = folder_path_val
+            if not folder_path_val:
                 valid, err = False, "folder_path is required for scan_type=folder"
         if not inputs["repo_url"]:
             valid, err = False, "repo_url is required for scan_type=repo/folder"
 
     elif scan_type == "zip":
-        inputs["archive_url"] = (archive_url or "").strip()
-        inputs["archive_file"] = (archive_file or "").strip()
+        inputs["archive_url"] = (st.session_state.get("archive_url_input", "") or "").strip()
+        inputs["archive_file"] = (st.session_state.get("archive_file_input", "") or "").strip()
         if not inputs["archive_url"] and not inputs["archive_file"]:
             valid, err = False, "Provide archive_url or archive_file for scan_type=zip"
 
     elif scan_type == "tar":
-        inputs["archive_url"] = (archive_url or "").strip()
+        inputs["archive_url"] = (st.session_state.get("archive_url_input", "") or "").strip()
         if not inputs["archive_url"]:
             valid, err = False, "archive_url is required for scan_type=tar"
 
     elif scan_type == "docker":
-        inputs["docker_image"] = (docker_image or "").strip()
+        inputs["docker_image"] = (st.session_state.get("docker_image_input", "") or "").strip()
         if not inputs["docker_image"]:
             valid, err = False, "docker_image is required for scan_type=docker"
 
@@ -206,7 +234,7 @@ if run:
     else:
         url = f"https://api.github.com/repos/{OWNER}/{REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
         payload = {"ref": BRANCH, "inputs": inputs}
-        resp = requests.post(url, headers=headers, json=payload)
+        resp = requests.post(url, headers=HEADERS, json=payload)
 
         if resp.status_code == 204:
             st.success("✅ Scan started! Open Actions to watch progress.")
@@ -215,4 +243,3 @@ if run:
                 st.json(inputs)
         else:
             st.error(f"❌ Failed: {resp.status_code} {resp.text}")
-
