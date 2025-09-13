@@ -1,4 +1,14 @@
-name: ScanCode Toolkit Scan (Repo / Folder / Zip / Tar / Docker)
+name: ScanCode Toolkit Scan
 
 on:
   workflow_dispatch:
+    inputs:
+      scan_type:
+        description: "Scan type"
+        required: true
+        type: choice
+        options:
+          - repo
+          - zip
+          - docker
+        default: repo
