@@ -77,15 +77,12 @@ for key, default in [
 def set_ref_from_picker():
     sel = st.session_state.get("ref_picker", "")
     if sel and sel != "-- choose --":
-        # Update the text_input's value via session_state (safe)
-        st.session_state["git_ref_input"] = sel
-        # Callback automatically triggers a rerun
+        st.session_state["git_ref_input"] = sel  # safe: callback updates the text_input key
 
 # ===================== UI: SCAN TYPE ===================== #
 scan_type = st.selectbox("Select Scan Type", ["repo", "folder", "zip", "tar", "docker"], index=0)
 
 # ===================== UI: SIDE-BY-SIDE INPUTS ===================== #
-# We keep fields aligned in columns per scan type.
 if scan_type in ("repo", "folder"):
     c1, c2, c3 = st.columns([3, 2, 2])
     with c1:
@@ -96,7 +93,6 @@ if scan_type in ("repo", "folder"):
             help="Supports web URLs like …/tree/<ref>, …/commit/<sha>, …/releases/tag/<tag>."
         )
     with c2:
-        # Uses session_state key so picker can update it
         git_ref_input = st.text_input(
             "Git ref (branch/tag/commit)",
             key="git_ref_input",
@@ -140,7 +136,6 @@ if scan_type in ("repo", "folder"):
         else:
             st.caption("Manual mode enabled — type directly in the Git ref box.")
 
-    # Preview normalization (compact)
     _norm_url, _resolved_ref, _meta = normalize_github_url_and_ref(st.session_state.get("repo_url_input", ""), st.session_state.get("git_ref_input", ""))
     st.caption(f"🔧 Repo URL (normalized): {_norm_url or '(none)'} | Ref: {_resolved_ref or '(none)'}")
 
@@ -178,56 +173,67 @@ with o5:
 # ===================== ACTION ===================== #
 run = st.button("🚀 Start Scan", use_container_width=True)
 if run:
-    # Build the inputs expected by the workflow
+    # Base inputs (always include scan_type + toggles; booleans as lowercase strings)
     inputs = {
         "scan_type": scan_type,
-        # toggles must be strings for workflow_dispatch inputs
         "enable_license_scan": str(st.session_state["opt_license"]).lower(),
         "enable_metadata_scan": str(st.session_state["opt_meta"]).lower(),
         "enable_package": str(st.session_state["opt_pkg"]).lower(),
         "enable_sbom_export": str(st.session_state["opt_sbom"]).lower(),
         "enable_copyright_scan": str(st.session_state["opt_copy"]).lower(),
-        # always include all keys expected by YAML; blanks are fine
-        "repo_url": "",
-        "git_ref": "",
-        "folder_path": "",
-        "archive_url": "",
-        "archive_file": "",
-        "docker_image": "",
     }
 
     valid, err = True, None
 
+    # Add ONLY the fields required for the chosen scan_type
     if scan_type in ("repo", "folder"):
         repo_url_val = st.session_state.get("repo_url_input", "")
         git_ref_val = st.session_state.get("git_ref_input", "")
         norm_repo_url, resolved_ref, _ = normalize_github_url_and_ref(repo_url_val, git_ref_val)
-        inputs["repo_url"] = norm_repo_url
-        if resolved_ref:
-            inputs["git_ref"] = resolved_ref
+        if not norm_repo_url:
+            valid, err = False, "repo_url is required for scan_type=repo/folder"
+        else:
+            inputs["repo_url"] = norm_repo_url
+            if resolved_ref:
+                inputs["git_ref"] = resolved_ref
         if scan_type == "folder":
             folder_path_val = (st.session_state.get("folder_path_input", "") or "").strip()
-            inputs["folder_path"] = folder_path_val
             if not folder_path_val:
                 valid, err = False, "folder_path is required for scan_type=folder"
-        if not inputs["repo_url"]:
-            valid, err = False, "repo_url is required for scan_type=repo/folder"
+            else:
+                inputs["folder_path"] = folder_path_val
 
     elif scan_type == "zip":
-        inputs["archive_url"] = (st.session_state.get("archive_url_input", "") or "").strip()
-        inputs["archive_file"] = (st.session_state.get("archive_file_input", "") or "").strip()
-        if not inputs["archive_url"] and not inputs["archive_file"]:
+        url_val = (st.session_state.get("archive_url_input", "") or "").strip()
+        file_val = (st.session_state.get("archive_file_input", "") or "").strip()
+        if not url_val and not file_val:
             valid, err = False, "Provide archive_url or archive_file for scan_type=zip"
+        else:
+            if url_val: inputs["archive_url"] = url_val
+            if file_val: inputs["archive_file"] = file_val
 
     elif scan_type == "tar":
-        inputs["archive_url"] = (st.session_state.get("archive_url_input", "") or "").strip()
-        if not inputs["archive_url"]:
+        url_val = (st.session_state.get("archive_url_input", "") or "").strip()
+        if not url_val:
             valid, err = False, "archive_url is required for scan_type=tar"
+        else:
+            inputs["archive_url"] = url_val
 
     elif scan_type == "docker":
-        inputs["docker_image"] = (st.session_state.get("docker_image_input", "") or "").strip()
-        if not inputs["docker_image"]:
+        img_val = (st.session_state.get("docker_image_input", "") or "").strip()
+        if not img_val:
             valid, err = False, "docker_image is required for scan_type=docker"
+        else:
+            inputs["docker_image"] = img_val
+
+    # Guardrail: keep total input keys ≤ 10 for the API
+    if valid and len(inputs) > 10:
+        # If somehow exceeded (future fields), drop optional git_ref first
+        if "git_ref" in inputs and len(inputs) > 10:
+            inputs.pop("git_ref")
+        # If still >10, drop enable_sbom_export next (least critical at dispatch time)
+        if len(inputs) > 10 and "enable_sbom_export" in inputs:
+            inputs.pop("enable_sbom_export")
 
     if not valid:
         st.error(f"❌ {err}")
