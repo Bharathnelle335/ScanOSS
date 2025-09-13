@@ -1,246 +1,303 @@
-import streamlit as st
+import io
+import re
+import uuid
 import requests
+import streamlit as st
 from datetime import datetime
 
-# ----------------------- Page Config -----------------------
-st.set_page_config(page_title="SCANOSS Workflow Trigger", page_icon="🧩", layout="wide")
+# ===================== CONFIG ===================== #
+OWNER = "Bharathnelle335"               # repo owner that hosts the workflow
+REPO = "scanOSS"                         # repo that holds the SCANOSS workflow
+WORKFLOW_FILE = "ScanOSS.yml"            # exact filename under .github/workflows/
+BRANCH = "main"                          # branch/tag where the workflow file exists
+TOKEN = st.secrets.get("GITHUB_TOKEN", "")  # PAT with repo + workflow scopes
 
+BASE = f"https://api.github.com/repos/{OWNER}/{REPO}"
+HEADERS = {
+    "Accept": "application/vnd.github+json",
+    **({"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}),
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+
+# ===================== PAGE ===================== #
+st.set_page_config(page_title="SCANOSS Workflow Trigger", page_icon="🧩", layout="wide")
 st.title("🧩 SCANOSS Workflow Trigger")
 st.caption("© EY Internal Use Only")
 
-# ----------------------- Sidebar: Workflow Config -----------------------
-with st.sidebar:
-    st.header("Workflow Config")
-    workflow_file = st.text_input("Workflow file name", value="ScanOSS.yml")
-    st.markdown("---")
-    st.caption("Auth: uses `st.secrets['GITHUB_TOKEN']`. Create a classic PAT with repo + workflow scopes.")
-
-# ----------------------- Helpers -----------------------
-TOKEN = st.secrets.get("GITHUB_TOKEN", "")
 if not TOKEN:
-    st.warning("⚠️ No GITHUB_TOKEN found in secrets. Add it to `.streamlit/secrets.toml` as GITHUB_TOKEN.")
+    st.warning("No GitHub token found. Add `GITHUB_TOKEN` to Streamlit secrets for private repos and higher rate limits.")
 
-session = requests.Session()
-session.headers.update({
-    "Accept": "application/vnd.github+json",
-    "Authorization": f"Bearer {TOKEN}" if TOKEN else "",
-    "X-GitHub-Api-Version": "2022-11-28",
-})
-
-OWNER = "Bharathnelle335"
-REPO = "scanOSS"
-
-# ---- GitHub paging helper ----
-def _next_link(headers: dict) -> str | None:
-    link = headers.get("Link")
-    if not link:
-        return None
-    for part in link.split(","):
-        seg = part.strip()
-        if 'rel="next"' in seg:
-            start = seg.find("<")
-            end = seg.find(">", start + 1)
-            if start != -1 and end != -1:
-                return seg[start + 1:end]
-    return None
-
-# ---- API helpers ----
-def dispatch_workflow(owner: str, repo: str, workflow_file: str, ref: str, inputs: dict):
-    url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches"
-    payload = {"ref": ref, "inputs": inputs}
-    r = session.post(url, json=payload, timeout=60)
-    return r
+# ===================== HELPERS ===================== #
+def gh_get(url: str, **kw):
+    return requests.get(url, headers=HEADERS, timeout=30, **kw)
 
 
-def list_recent_runs(owner: str, repo: str, per_page: int = 20):
-    url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
-    params = {"event": "workflow_dispatch", "per_page": per_page}
-    r = session.get(url, params=params, timeout=60)
-    if r.ok:
-        return r.json().get("workflow_runs", [])
-    return []
+def gh_post(url: str, payload: dict):
+    return requests.post(url, headers=HEADERS, json=payload, timeout=60)
 
 
-def find_run_by_client_tag(runs: list, client_run_id: str):
-    client_run_id = (client_run_id or "").strip()
-    if not client_run_id:
-        return None
-    for run in runs:
-        name = run.get("name") or run.get("display_title") or ""
-        if client_run_id in name:
-            return run
-    return None
+def fetch_branches(owner: str, repo: str, per_page: int = 100):
+    r = gh_get(f"https://api.github.com/repos/{owner}/{repo}/branches?per_page={per_page}")
+    return [b.get("name") for b in (r.json() if r.ok else []) if isinstance(b, dict) and b.get("name")] if r.ok else []
 
 
-def list_all_branches_and_tags(owner: str, repo: str):
-    branches, tags = [], []
-    url_b = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=100"
-    while url_b:
-        rb = session.get(url_b, timeout=30)
-        if rb.ok and isinstance(rb.json(), list):
-            branches.extend([b.get("name") for b in rb.json() if isinstance(b, dict) and b.get("name")])
-        url_b = _next_link(rb.headers) if rb.ok else None
+def fetch_tags(owner: str, repo: str, per_page: int = 100):
+    r = gh_get(f"https://api.github.com/repos/{owner}/{repo}/tags?per_page={per_page}")
+    return [t.get("name") for t in (r.json() if r.ok else []) if isinstance(t, dict) and t.get("name")] if r.ok else []
 
-    url_t = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
-    while url_t:
-        rt = session.get(url_t, timeout=30)
-        if rt.ok and isinstance(rt.json(), list):
-            tags.extend([t.get("name") for t in rt.json() if isinstance(t, dict) and t.get("name")])
-        url_t = _next_link(rt.headers) if rt.ok else None
 
-    # De-dup while preserving order
-    def _dedup(seq):
-        seen = set(); out = []
-        for s in seq:
-            if s not in seen:
-                out.append(s); seen.add(s)
-        return out
-    return _dedup(branches), _dedup(tags)
+def normalize_github_url_and_ref(url: str, ref_input: str):
+    """Normalize GH URLs to .git and resolve ref from URL or explicit input."""
+    url = (url or "").strip()
+    ref_in = (ref_input or "").strip()
+    ref_in = ref_in.replace("refs/heads/", "").replace("refs/tags/", "")
 
-# Persist refs between reruns
-st.session_state.setdefault("__branches__", [])
-st.session_state.setdefault("__tags__", [])
-st.session_state.setdefault("__branch_sel__", "")
-st.session_state.setdefault("__tag_sel__", "")
+    base_url = url
+    detected_ref = ""
+    if url.startswith("https://github.com/"):
+        if "/tree/" in url:
+            detected_ref = url.split("/tree/", 1)[1].split("/", 1)[0]
+            base_url = url.split("/tree/", 1)[0]
+        elif "/commit/" in url:
+            detected_ref = url.split("/commit/", 1)[1].split("/", 1)[0]
+            base_url = url.split("/commit/", 1)[0]
+        elif "/releases/tag/" in url:
+            detected_ref = url.split("/releases/tag/", 1)[1].split("/", 1)[0]
+            base_url = url.split("/releases/tag/", 1)[0]
+        if not base_url.endswith(".git"):
+            base_url = base_url.rstrip("/") + ".git"
 
-# ----------------------- Main: Dispatch Inputs -----------------------
-st.subheader("Dispatch inputs")
+    resolved_ref = ref_in or detected_ref or ""
+    return base_url, resolved_ref, {"parsed_from_url": bool(detected_ref), "detected_ref": detected_ref}
 
-colA, colB = st.columns(2)
-with colA:
-    scan_type = st.selectbox("scan_type", ["docker", "git", "upload-zip", "upload-tar"], index=0)
-    image_scan_mode = st.selectbox("image_scan_mode (for images)", ["manual", "syft"], index=0)
-    enable_scanoss_bool = st.checkbox("enable_scanoss", value=True)
-    enable_scanoss = "true" if enable_scanoss_bool else "false"
-with colB:
-    client_run_id = st.text_input("client_run_id (optional tag)", value=datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
 
-# ----------------------- Conditional Inputs -----------------------
-docker_image = ""
-git_url = ""
-git_ref = ""
-archive_url = ""
+def parse_owner_repo(url: str):
+    m = re.search(r"github\\.com/([^/]+)/([^/\\.]+)(?:\\.git)?$", url.strip().rstrip("/"))
+    if not m:
+        m = re.search(r"github\\.com/([^/]+)/([^/]+)", url.strip())
+    if m:
+        return m.group(1), m.group(2).replace(".git", "")
+    return None, None
 
-if scan_type == "docker":
-    docker_image = st.text_input("docker_image (e.g., nginx:latest)")
-elif scan_type == "git":
-    git_url = st.text_input("git_url (e.g., https://github.com/user/repo or .../tree/v1.2.3)")
-    git_ref = st.text_input("git_ref (optional if included in git_url)", value="")
+
+def list_workflow_runs(per_page=30):
+    # Only runs for this workflow + branch + workflow_dispatch
+    url = f"{BASE}/actions/workflows/{WORKFLOW_FILE}/runs"
+    return gh_get(url, params={"per_page": per_page, "event": "workflow_dispatch", "branch": BRANCH})
+
+
+def find_run_by_tag(runs: list, tag: str):
+    for r in runs:
+        title = r.get("display_title") or r.get("name") or ""
+        if tag and tag in title:
+            return r
+    return runs[0] if runs else None
+
+
+def get_run_artifacts(run_id: int):
+    return gh_get(f"{BASE}/actions/runs/{run_id}/artifacts", params={"per_page": 100})
+
+
+def download_artifact_zip(artifact_id: int) -> bytes:
+    r = gh_get(f"{BASE}/actions/artifacts/{artifact_id}/zip", stream=True)
+    if not r.ok:
+        return b""
+    return r.content
+
+
+def new_client_tag() -> str:
+    return datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+# ===================== SESSION STATE ===================== #
+for key, default in [
+    ("git_ref_input", ""),
+    ("_branches", []),
+    ("_tags", []),
+    ("ref_picker", "-- choose --"),
+    ("last_client_run_id", ""),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def set_ref_from_picker():
+    sel = st.session_state.get("ref_picker", "")
+    if sel and sel != "-- choose --":
+        st.session_state["git_ref_input"] = sel
+
+# ===================== UI: MODE + SIDE-BY-SIDE INPUTS ===================== #
+scan_type = st.selectbox("scan_type", ["docker", "git", "upload-zip", "upload-tar"], index=0)
+
+placeholders = {
+    "git": "https://github.com/psf/requests",
+    "upload-zip": "https://example.com/sample.zip  (or workspace path like sample.zip)",
+    "upload-tar": "https://example.com/src.tar.gz  (or workspace path like src.tar.gz / .tar.xz)",
+    "docker": "alpine:latest",
+}
+helps = {
+    "git": "Repo URL. Supports pasting /tree/<ref>, /commit/<sha>, /releases/tag/<tag>.",
+    "upload-zip": "ZIP via HTTP(S) URL (recommended) or a workspace file path (uploaded artifact).",
+    "upload-tar": "TAR/TAR.GZ/TGZ/TAR.XZ via HTTP(S) URL (recommended) or workspace file path.",
+    "docker": "Docker image name, e.g., alpine:latest or ghcr.io/org/image:tag.",
+}
+
+if scan_type == "git":
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        git_url = st.text_input("Source (Repo URL)", placeholders[scan_type], key="source_input", help=helps[scan_type])
+    with c2:
+        git_ref = st.text_input(
+            "Git ref (branch/tag/commit)",
+            key="git_ref_input",
+            help="Leave empty to auto-detect from URL; fallback is 'main'.",
+        )
+
+    # Ref picker (matches reference layout)
+    norm_url_preview, _, _ = normalize_github_url_and_ref(st.session_state.get("source_input", ""), "")
+    owner, repo_name = parse_owner_repo(norm_url_preview)
+    with st.expander("🔎 Pick ref (load tags/branches)", expanded=False):
+        cols = st.columns([1, 1, 2])
+        with cols[0]:
+            load_refs = st.button("🔄 Load refs", use_container_width=True)
+        with cols[1]:
+            pick_mode = st.radio("From", ["Tags", "Branches", "Manual"], horizontal=True, index=0)
+
+        if load_refs and owner and repo_name:
+            st.session_state["_branches"] = fetch_branches(owner, repo_name)
+            st.session_state["_tags"] = fetch_tags(owner, repo_name)
+
+        if pick_mode in ("Tags", "Branches"):
+            opts = st.session_state["_tags"] if pick_mode == "Tags" else st.session_state["_branches"]
+            if not opts:
+                st.warning("Click **Load refs** to fetch from GitHub.")
+            else:
+                st.selectbox(
+                    f"Select {pick_mode[:-1].lower()}",
+                    options=["-- choose --"] + opts,
+                    index=0,
+                    key="ref_picker",
+                    on_change=set_ref_from_picker,
+                )
+        else:
+            st.caption("Manual mode — type directly in the Git ref box above.")
+
+    _norm_url, _resolved_ref, _meta = normalize_github_url_and_ref(
+        st.session_state.get("source_input", ""), st.session_state.get("git_ref_input", "")
+    )
+    st.caption(f"🔧 Repo URL (normalized): {_norm_url or '(none)'} | Ref: {_resolved_ref or '(none)'}")
+
 elif scan_type in ("upload-zip", "upload-tar"):
-    st.caption("Provide a direct-download URL for the archive.")
-    samples = {
-        "ZIP sample": "https://github.com/actions/checkout/archive/refs/heads/main.zip",
-        "TAR.GZ sample": "https://github.com/actions/checkout/archive/refs/heads/main.tar.gz",
-    }
-    use_sample = st.selectbox("Use a sample URL?", ["(none)"] + list(samples.keys()), index=0)
-    if use_sample != "(none)":
-        archive_url = samples[use_sample]
-    archive_url = st.text_input("archive_url", value=archive_url)
+    c1, _ = st.columns([3, 2])
+    with c1:
+        archive_url = st.text_input("Source", placeholders[scan_type], key="source_input", help=helps[scan_type])
+    git_ref = ""; git_url = st.session_state.get("source_input", ""); docker_image = ""
+else:  # docker
+    c1, _ = st.columns([3, 2])
+    with c1:
+        docker_image = st.text_input("Source", placeholders[scan_type], key="source_input", help=helps[scan_type])
+    git_ref = ""; git_url = ""; archive_url = ""
 
-# ----------------------- Ref selection (Branches & Tags) -----------------------
-st.markdown("---")
-ref_cols = st.columns([1, 1, 2])
-with ref_cols[0]:
-    if st.button("🔄 Load branches/tags"):
-        branches, tags = list_all_branches_and_tags(OWNER, REPO)
-        st.session_state.__branches__ = branches
-        st.session_state.__tags__ = tags
-        if not (branches or tags):
-            st.warning("No branches or tags found, or token missing access.")
+# ===================== UI: OPTIONS (SIDE-BY-SIDE) ===================== #
+st.markdown("### Scan options")
+o1, o2, o3 = st.columns(3)
+with o1:
+    image_scan_mode = st.selectbox("image_scan_mode (for images)", ["manual", "syft"], index=0)
+with o2:
+    enable_scanoss_bool = st.checkbox("enable_scanoss", value=True)
+with o3:
+    client_run_id = st.text_input("client_run_id", value=st.session_state.get("last_client_run_id") or new_client_tag())
+    st.session_state["last_client_run_id"] = client_run_id
 
-# Prepare dropdown options
-branches_options = [""] + (st.session_state.__branches__ or [])
-# Put 'main' to the top if present
-if "main" in branches_options:
-    branches_options = ["", "main"] + [b for b in branches_options if b not in ("", "main")]
+enable_scanoss = "true" if enable_scanoss_bool else "false"
 
-tags_options = [""] + (st.session_state.__tags__ or [])
-
-# Two separate boxes
-ref_cols2 = st.columns(2)
-with ref_cols2[0]:
-    st.session_state.__branch_sel__ = st.selectbox("Branch", branches_options, index=0)
-with ref_cols2[1]:
-    st.session_state.__tag_sel__ = st.selectbox("Tag", tags_options, index=0)
-
-# Final ref resolution: prefer selected branch, otherwise selected tag, otherwise 'main'
-ref_choice = st.session_state.__branch_sel__ or st.session_state.__tag_sel__ or "main"
-
-# ----------------------- Submit -----------------------
-col1, col2, _ = st.columns([1, 1, 3])
-with col1:
-    go = st.button("🚀 Dispatch Workflow")
-with col2:
-    chk = st.button("🔎 Find My Run (by client_run_id)")
-
-status_box = st.empty()
-
-if go:
+# ===================== DISPATCH ===================== #
+run = st.button("🚀 Start Scan", use_container_width=True, type="primary")
+if run:
     err = None
-    if scan_type == "docker" and not docker_image:
+    if scan_type == "docker" and not st.session_state.get("source_input"):
         err = "docker_image is required for scan_type=docker"
-    if scan_type == "git" and not git_url:
+    if scan_type == "git" and not st.session_state.get("source_input"):
         err = "git_url is required for scan_type=git"
-    if scan_type in ("upload-zip", "upload-tar") and not archive_url:
+    if scan_type in ("upload-zip", "upload-tar") and not st.session_state.get("source_input"):
         err = f"archive_url is required for scan_type={scan_type}"
 
     if err:
-        status_box.error(err)
+        st.error(f"❌ {err}")
     else:
+        # Build inputs to match SCANOSS workflow
         inputs = {
             "scan_type": scan_type,
             "image_scan_mode": image_scan_mode,
-            "docker_image": docker_image,
-            "git_url": git_url,
-            "git_ref": git_ref,
-            "enable_scanoss": enable_scanoss,
-            "archive_url": archive_url,
+            "docker_image": st.session_state.get("source_input") if scan_type == "docker" else "",
+            "git_url": st.session_state.get("source_input") if scan_type == "git" else "",
+            "git_ref": st.session_state.get("git_ref_input") if scan_type == "git" else "",
+            "archive_url": st.session_state.get("source_input") if scan_type in ("upload-zip", "upload-tar") else "",
+            "enable_scanoss": "true" if enable_scanoss_bool else "false",
             "client_run_id": client_run_id,
         }
-        try:
-            r = dispatch_workflow(OWNER, REPO, workflow_file, ref_choice, inputs)
-            if r.status_code in (201, 202, 204):
-                status_box.success("✅ Dispatched! Open your repo's Actions tab to watch the run.")
-            else:
-                status_box.error(f"❌ Dispatch failed: {r.status_code} — {r.text}")
-        except Exception as e:
-            status_box.error(f"❌ Exception while dispatching: {e}")
+        # Dispatch always against BRANCH where the workflow file exists
+        payload = {"ref": BRANCH, "inputs": inputs}
+        resp = gh_post(f"{BASE}/actions/workflows/{WORKFLOW_FILE}/dispatches", payload)
+        if resp.status_code == 204:
+            st.success("✅ Scan started!")
+            with st.expander("Submitted Inputs", expanded=False):
+                st.json(inputs)
+        else:
+            st.error(f"❌ Failed: {resp.status_code} {resp.text}")
 
-if chk:
-    runs = list_recent_runs(OWNER, REPO, per_page=30)
-    run = find_run_by_client_tag(runs, client_run_id)
-    if not run:
-        st.info("No recent run found with this client_run_id in its run name. It may still be starting.")
-    else:
-        name = run.get("name") or run.get("display_title")
-        status = run.get("status")
-        conclusion = run.get("conclusion")
-        html_url = run.get("html_url")
-        created = run.get("created_at")
-        st.success(f"Found run: {name}")
-        st.write(f"**Status:** {status}  |  **Conclusion:** {conclusion}  |  **Created:** {created}")
-        if html_url:
-            st.markdown(f"➡️ [Open in GitHub]({html_url})")
-
-        art_url = run.get("artifacts_url")
-        if art_url:
-            try:
-                ar = session.get(art_url, timeout=60)
-                if ar.ok:
-                    arts = ar.json().get("artifacts", [])
-                    if arts:
-                        st.subheader("Artifacts")
-                        for a in arts:
-                            st.write(f"• **{a.get('name')}**  ({a.get('size_in_bytes')} bytes)")
-                            dl = a.get("archive_download_url")
-                            if dl:
-                                st.code(dl, language="text")
-                    else:
-                        st.caption("No artifacts on this run yet.")
-                else:
-                    st.caption(f"Could not list artifacts: {ar.status_code}")
-            except Exception as e:
-                st.caption(f"Artifacts lookup error: {e}")
-
+# ===================== RESULTS: STATUS + DOWNLOAD ===================== #
 st.markdown("---")
-st.caption("Tip: For `upload-zip` or `upload-tar`, provide a direct-download URL. For GitHub repos, you can use `.../archive/refs/heads/main.zip` or `.tar.gz`.")
+st.header("📦 Results")
+
+res_c1, res_c2 = st.columns([3, 1])
+with res_c1:
+    result_tag = st.text_input("Run tag to check", value=st.session_state.get("last_client_run_id", ""))
+with res_c2:
+    check = st.button("🔎 Check status & fetch", use_container_width=True)
+
+if check:
+    if not result_tag:
+        st.error("Provide a run tag (client_run_id).")
+    else:
+        runs_resp = list_workflow_runs(per_page=50)
+        if not runs_resp.ok:
+            st.error(f"Failed to list runs: {runs_resp.status_code} {runs_resp.text}")
+        else:
+            runs = runs_resp.json().get("workflow_runs", [])
+            run = find_run_by_tag(runs, result_tag)
+            if not run:
+                st.warning("No run found yet for this tag. Try again shortly.")
+            else:
+                run_id = run["id"]
+                status = run.get("status")
+                conclusion = run.get("conclusion")
+                started = run.get("run_started_at")
+                html_url = run.get("html_url")
+                st.write(f"**Run:** [{run_id}]({html_url})")
+                st.write(f"**Status:** {status}  |  **Conclusion:** {conclusion or '—'}  |  **Started:** {started or '—'}")
+
+                arts_resp = get_run_artifacts(run_id)
+                if not arts_resp.ok:
+                    st.error(f"Failed to list artifacts: {arts_resp.status_code} {arts_resp.text}")
+                else:
+                    artifacts = arts_resp.json().get("artifacts", [])
+                    if not artifacts:
+                        st.warning("No artifacts found for this run.")
+                    else:
+                        # Prefer artifact with tag in name; else the first
+                        art = None
+                        for a in artifacts:
+                            if result_tag in a.get("name", ""):
+                                art = a; break
+                        if not art:
+                            art = artifacts[0]
+                        st.write(f"**Artifact:** `{art.get('name')}`  •  size ~ {art.get('size_in_bytes', 0)} bytes")
+                        if not art.get("expired", False):
+                            data = download_artifact_zip(art["id"])
+                            if data:
+                                fname = f"{art.get('name','scanoss-results')}.zip"
+                                st.download_button("⬇️ Download ZIP", data=data, file_name=fname, mime="application/zip")
+                            else:
+                                st.error("Failed to download artifact zip (empty response).")
+                        else:
+                            st.error("Artifact expired (per repo retention). Re-run the scan.")
