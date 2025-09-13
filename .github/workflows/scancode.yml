@@ -1,8 +1,7 @@
-name: OSS Compliance - SCANOSS (Docker/Git/Upload) • manual or syft
+name: OSS Compliance - SCANOSS (manual only) • docker/git/upload
 
 run-name: >-
   SCANOSS ${{ github.event.inputs.scan_type }} •
-  mode=${{ github.event.inputs.image_scan_mode }} •
   ${{ github.event.inputs.docker_image || github.event.inputs.git_url || github.event.inputs.archive_url || 'upload' }} •
   ${{ github.event.inputs.client_run_id }}
 
@@ -10,45 +9,44 @@ on:
   workflow_dispatch:
     inputs:
       scan_type:
-        description: 'Scan a Docker image, Git repo, uploaded source.zip or image.tar archive'
+        description: 'Scan a Docker image, Git repo, uploaded source.zip or .tar'
         required: true
         default: 'docker'
         type: choice
         options: [docker, git, upload-zip, upload-tar]
 
-      image_scan_mode:
-        description: 'How to scan container images (docker/export manual vs syft-driven)'
-        required: true
-        default: 'manual'
-        type: choice
-        options: [manual, syft]
-
       docker_image:
-        description: 'Docker image name (e.g., nginx:latest) [scan_type: docker]'
+        description: 'Docker image (e.g., nginx:latest) [scan_type: docker]'
         required: false
 
       git_url:
-        description: 'Git repository URL (e.g., https://github.com/user/repo OR https://github.com/user/repo/tree/v1.2.3)'
+        description: 'Git URL (https://github.com/org/repo or /tree/<tag>)'
         required: false
 
       git_ref:
-        description: 'Branch / tag / commit to scan [scan_type: git]. Leave blank if included in git_url (tree/commit/tag).'
+        description: 'Branch/tag/commit (optional if included in URL)'
         required: false
         default: ''
-
-      enable_scanoss:
-        description: 'Run SCANOSS OSS scan?'
-        required: false
-        default: 'true'
-        type: boolean
 
       archive_url:
-        description: 'Remote .zip or .tar(.gz|.xz) URL (used only when scan_type is upload-zip or upload-tar)'
+        description: 'Remote .zip or .tar(.gz|.xz) URL (for upload-zip/upload-tar)'
         required: false
         default: ''
 
+      unpack_archives:
+        description: 'Unpack nested archives (jar/war/zip/tar*) before scan (git/upload only)'
+        required: true
+        default: false
+        type: boolean
+
+      enable_scanoss:
+        description: 'Run SCANOSS scan'
+        required: true
+        default: true
+        type: boolean
+
       client_run_id:
-        description: 'Opaque run tag from the UI (for status + artifact lookup)'
+        description: 'Opaque run tag (for artifact lookup)'
         required: false
         default: ''
 
@@ -56,40 +54,33 @@ jobs:
   oss-compliance:
     runs-on: ubuntu-latest
     env:
-      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}   # you added this
-      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}   # optional (omit if not using a private endpoint)
+      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}
+      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}
 
     steps:
       # -------------------------- Setup --------------------------
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install system deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y git curl unzip xz-utils tar
+          sudo apt-get install -y git curl unzip xz-utils tar jq rsync
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install SCANOSS and Excel deps
+      - name: Install SCANOSS + Excel deps
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install --user scanoss pandas openpyxl
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
 
-      - name: Install Syft (only if image_scan_mode == syft)
-        if: ${{ github.event.inputs.image_scan_mode == 'syft' }}
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-          | sh -s -- -b /usr/local/bin
-          syft version
-
-      # -------- Normalize Docker image input (handles "alpine: latest") --------
-      - name: Normalize Docker image input
+      # ---------------- Docker image normalization ----------------
+      - name: Normalize Docker image
         if: ${{ github.event.inputs.scan_type == 'docker' }}
         shell: bash
         run: |
@@ -98,11 +89,10 @@ jobs:
           RAW_TRIM="$(echo "$RAW" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
           IMG_REF="$(echo "$RAW_TRIM" | sed -E 's/[[:space:]]*:[[:space:]]*/:/g' | tr -d '\r')"
           if ! echo "$IMG_REF" | grep -Eq '^[[:alnum:]][[:alnum:]._/-]*(:[[:alnum:]._-]+)?(@sha256:[a-f0-9]{64})?$'; then
-            echo "❌ Invalid docker image reference after normalization: '$IMG_REF'" >&2
-            exit 1
+            echo "❌ Invalid docker image reference after normalization: '$IMG_REF'" >&2; exit 1
           fi
           echo "DOCKER_IMAGE_REF=$IMG_REF" >> "$GITHUB_ENV"
-          echo "✅ Using Docker image: $IMG_REF"
+          echo "✅ Docker image: $IMG_REF"
 
       # -------------------------- Prepare source --------------------------
       - name: Pull Docker image
@@ -114,139 +104,144 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RAW_URL="${{ github.event.inputs.git_url }}"
-          RAW_REF="${{ github.event.inputs.git_ref }}"
-          if [[ -z "${RAW_URL}" ]]; then
-            echo "❌ git_url is required when scan_type=git" >&2
-            exit 1
-          fi
-
+          RAW_URL="${{ github.event.inputs.git_url }}"; RAW_REF="${{ github.event.inputs.git_ref }}"
+          [ -z "$RAW_URL" ] && { echo "❌ git_url required"; exit 1; }
           BASE_URL=""; DET_REF=""
           case "$RAW_URL" in
-            https://github.com/*/tree/*)
-              DET_REF="${RAW_URL##*/tree/}"; DET_REF="${DET_REF%%/*}"
-              BASE_URL="${RAW_URL%%/tree/*}.git" ;;
-            https://github.com/*/commit/*)
-              DET_REF="${RAW_URL##*/commit/}"; DET_REF="${DET_REF%%/*}"
-              BASE_URL="${RAW_URL%%/commit/*}.git" ;;
-            https://github.com/*/releases/tag/*)
-              DET_REF="${RAW_URL##*/releases/tag/}"; DET_REF="${DET_REF%%/*}"
-              BASE_URL="${RAW_URL%%/releases/tag/*}.git" ;;
-            https://github.com/*/*)
-              BASE_URL="${RAW_URL%.git}.git" ;;
-            *) BASE_URL="${RAW_URL}" ;;
+            https://github.com/*/tree/*)   DET_REF="${RAW_URL##*/tree/}"; DET_REF="${DET_REF%%/*}"; BASE_URL="${RAW_URL%%/tree/*}.git";;
+            https://github.com/*/commit/*) DET_REF="${RAW_URL##*/commit/}"; DET_REF="${DET_REF%%/*}"; BASE_URL="${RAW_URL%%/commit/*}.git";;
+            https://github.com/*/releases/tag/*) DET_REF="${RAW_URL##*/releases/tag/}"; DET_REF="${DET_REF%%/*}"; BASE_URL="${RAW_URL%%/releases/tag/*}.git";;
+            https://github.com/*/*)        BASE_URL="${RAW_URL%.git}.git";;
+            *)                              BASE_URL="${RAW_URL}";;
           esac
-
           GIT_REF="${RAW_REF#refs/heads/}"; GIT_REF="${GIT_REF#refs/tags/}"
-          if [[ -z "${GIT_REF}" ]]; then
-            if [[ -n "${DET_REF}" ]]; then GIT_REF="${DET_REF}"; else GIT_REF="main"; fi
-          fi
-
-          echo "🔧 Repo: ${BASE_URL}"
-          echo "🔧 Ref:  ${GIT_REF}"
-
+          [ -z "$GIT_REF" ] && { if [ -n "$DET_REF" ]; then GIT_REF="$DET_REF"; else GIT_REF="main"; fi; }
+          echo "🔧 Repo: $BASE_URL @ $GIT_REF"
           rm -rf repo-to-scan
-          if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
-            git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" repo-to-scan || true
+          if git ls-remote --tags --heads "$BASE_URL" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
+            git clone --depth 1 --branch "$GIT_REF" "$BASE_URL" repo-to-scan || true
           fi
-          if [[ ! -d repo-to-scan ]]; then
-            git clone "${BASE_URL}" repo-to-scan
+          if [ ! -d repo-to-scan ]; then
+            git clone "$BASE_URL" repo-to-scan
             cd repo-to-scan
             git fetch --all --tags --prune
-            git checkout --detach "${GIT_REF}" || { echo "❌ Ref not found"; exit 1; }
+            git checkout --detach "$GIT_REF" || { echo "❌ Ref not found"; exit 1; }
             cd -
           fi
-          echo "✔ Checked out $(cd repo-to-scan && git rev-parse --short HEAD)"
+          echo "✔ HEAD: $(cd repo-to-scan && git rev-parse --short HEAD)"
 
-      - name: Unzip uploaded source archive (or download ZIP)
+      - name: Unzip uploaded source (or download ZIP)
         if: ${{ github.event.inputs.scan_type == 'upload-zip' }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p uploaded-source
           URL="${{ github.event.inputs.archive_url }}"
-          if [[ -n "$URL" ]]; then
-            echo "📥 Downloading ZIP from $URL …"
-            curl -L --fail --retry 3 --retry-delay 2 "$URL" -o input.zip
+          if [ -n "$URL" ]; then
+            echo "📥 Downloading ZIP from $URL"; curl -L --fail --retry 3 "$URL" -o input.zip
             unzip -q input.zip -d uploaded-source
           else
             unzip -q input/*.zip -d uploaded-source
           fi
 
-      - name: Extract uploaded TAR archive (or download TAR)
+      - name: Extract uploaded TAR (or download TAR) with image-tar auto-detect
         if: ${{ github.event.inputs.scan_type == 'upload-tar' }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p uploaded-tar
           URL="${{ github.event.inputs.archive_url }}"
-          if [[ -n "$URL" ]]; then
-            echo "📥 Downloading TAR from $URL …"
-            curl -L --fail --retry 3 --retry-delay 2 "$URL" -o input.tar
+          if [ -n "$URL" ]; then
+            echo "📥 Downloading TAR from $URL"; curl -L --fail --retry 3 "$URL" -o input.tar
             SRC="input.tar"
           else
-            SRC=$(ls input/*.tar 2>/dev/null | head -n1 || true)
-            if [[ -z "$SRC" ]]; then
-              echo "❌ No TAR found in input/ and no archive_url provided." >&2
-              exit 1
-            fi
+            SRC=$(ls input/*.tar* 2>/dev/null | head -n1 || true)
+            [ -z "$SRC" ] && { echo "❌ No TAR in input/"; exit 1; }
           fi
-          NAME="${SRC##*/}"
-          case "$NAME" in
-            *.tar.gz|*.tgz)  tar -xzf "$SRC" -C uploaded-tar ;;
-            *.tar.xz|*.txz)  tar -xJf "$SRC" -C uploaded-tar ;;
-            *.tar)           tar -xf  "$SRC" -C uploaded-tar ;;
-            *)               echo "ℹ️ Unknown TAR extension; trying generic -xf"; tar -xf "$SRC" -C uploaded-tar ;;
-          esac
+          # Detect Docker image tar by looking for manifest.json
+          TMPDIR="$(mktemp -d)"; tar -tf "$SRC" > "$TMPDIR/list.txt"
+          if grep -q '^manifest.json$' "$TMPDIR/list.txt"; then
+            echo "🧩 Detected Docker image tar; loading via docker and exporting merged rootfs"
+            docker load -i "$SRC" | tee "$TMPDIR/load.log" || true
+            # Try to get repo:tag from load log, else use image ID
+            IMG_REF="$(awk -F': ' '/Loaded image:/{ref=$2} END{print ref}' "$TMPDIR/load.log")"
+            if [ -z "$IMG_REF" ]; then
+              IMG_ID="$(awk -F': ' '/Loaded image ID:/{print $2}' "$TMPDIR/load.log")"
+              [ -z "$IMG_ID" ] && { echo "❌ Could not determine image from docker load"; exit 1; }
+              docker tag "$IMG_ID" upload-image:latest
+              IMG_REF="upload-image:latest"
+            fi
+            echo "DOCKER_IMAGE_FROM_TAR=$IMG_REF" >> "$GITHUB_ENV"
+            mkdir -p docker-output/exported-rootfs
+            CID="$(docker create "$IMG_REF" /bin/true)"
+            docker export "$CID" -o docker-output/rootfs.tar
+            docker rm "$CID" >/dev/null
+            tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+            echo "SCAN_DIR=docker-output/exported-rootfs" >> "$GITHUB_ENV"
+            echo "IS_IMAGE_TAR=true" >> "$GITHUB_ENV"
+          else
+            echo "📦 Regular source tar; extracting"
+            mkdir -p uploaded-tar
+            case "$SRC" in
+              *.tar.gz|*.tgz)  tar -xzf "$SRC" -C uploaded-tar ;;
+              *.tar.xz|*.txz)  tar -xJf "$SRC" -C uploaded-tar ;;
+              *.tar)           tar -xf  "$SRC" -C uploaded-tar ;;
+              *)               echo "ℹ️ Unknown extension; trying generic -xf"; tar -xf "$SRC" -C uploaded-tar ;;
+            esac
+            echo "SCAN_DIR=uploaded-tar" >> "$GITHUB_ENV"
+            echo "IS_IMAGE_TAR=false" >> "$GITHUB_ENV"
+          fi
 
-      # ---- Auto-detect Dockerfile & optionally build an image (non-docker modes) ----
-      - name: Detect Dockerfile and optionally build image
+      # -------- Auto-detect Dockerfile & optionally build image (git/upload) --------
+      - name: Detect Dockerfile and optionally build
         id: autodock
         if: ${{ github.event.inputs.scan_type != 'docker' }}
         run: |
           set -e
+          # Skip if upload-tar was an image tar (already handled)
+          if [ "${{ env.IS_IMAGE_TAR }}" = "true" ]; then
+            echo "has_image=true"  >> "$GITHUB_OUTPUT"
+            echo "image_ref=${{ env.DOCKER_IMAGE_FROM_TAR }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           SCAN_DIR="."
-          if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then SCAN_DIR="repo-to-scan"; fi
-          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then SCAN_DIR="uploaded-source"; fi
-          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then SCAN_DIR="uploaded-tar"; fi
-
-          HAS_IMAGE=false; IMAGE_REF=""
+          if [ "${{ github.event.inputs.scan_type }}" = "git" ]; then SCAN_DIR="repo-to-scan"; fi
+          if [ "${{ github.event.inputs.scan_type }}" = "upload-zip" ]; then SCAN_DIR="uploaded-source"; fi
+          if [ "${{ github.event.inputs.scan_type }}" = "upload-tar" ]; then SCAN_DIR="uploaded-tar"; fi
+          echo "SCAN_DIR=$SCAN_DIR" >> "$GITHUB_ENV"
           DF_PATH=$(find "$SCAN_DIR" -type f -iname 'Dockerfile' | head -n 1 || true)
-          if [[ -n "$DF_PATH" ]]; then
+          if [ -n "$DF_PATH" ]; then
             if docker build -t auto-scanned-image:latest "$(dirname "$DF_PATH")"; then
-              HAS_IMAGE=true; IMAGE_REF="auto-scanned-image:latest"
-              echo "✅ Docker image built"
+              echo "has_image=true"  >> "$GITHUB_OUTPUT"
+              echo "image_ref=auto-scanned-image:latest" >> "$GITHUB_OUTPUT"
             else
-              echo "⚠️ Docker build failed – skipping image-based scan"
+              echo "has_image=false" >> "$GITHUB_OUTPUT"
+              echo "image_ref="      >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "No Dockerfile – skip image build"
+            echo "has_image=false" >> "$GITHUB_OUTPUT"
+            echo "image_ref="      >> "$GITHUB_OUTPUT"
           fi
 
-          echo "has_image=$HAS_IMAGE"  >> "$GITHUB_OUTPUT"
-          echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
-
-      # ---------------- Label + run tag (sanitize for artifact names) ----------------
-      - name: Set LABEL and RUN_TAG env
+      # ---------------- Label + run tag (sanitize) ----------------
+      - name: Set LABEL and RUN_TAG
         shell: bash
         run: |
           set -euo pipefail
-          # RUN_TAG: client_run_id or GITHUB_RUN_ID, sanitized
           RUN_TAG_IN="${{ github.event.inputs.client_run_id }}"
-          if [ -z "${RUN_TAG_IN}" ]; then RUN_TAG_IN="${GITHUB_RUN_ID}"; fi
+          [ -z "$RUN_TAG_IN" ] && RUN_TAG_IN="${GITHUB_RUN_ID}"
           SAN_RUN_TAG="$(echo "$RUN_TAG_IN" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
           [ -z "$SAN_RUN_TAG" ] && SAN_RUN_TAG="${GITHUB_RUN_ID}"
           SAN_RUN_TAG="${SAN_RUN_TAG:0:80}"
 
-          # SCAN_LABEL: from source
           MODE="${{ github.event.inputs.scan_type }}"
           RAW=""
-          if [[ "$MODE" == "docker" ]]; then
+          if [ "$MODE" = "docker" ]; then
             RAW="${DOCKER_IMAGE_REF:-${{ github.event.inputs.docker_image }}}"
-          elif [[ "$MODE" == "git" ]]; then
+          elif [ "$MODE" = "git" ]; then
             RAW="${{ github.event.inputs.git_url }}"
-          elif [[ "$MODE" == "upload-zip" || "$MODE" == "upload-tar" ]]; then
-            if [[ -n "${{ github.event.inputs.archive_url }}" ]]; then
+          elif [ "$MODE" = "upload-zip" ] || [ "$MODE" = "upload-tar" ]; then
+            if [ -n "${{ github.event.inputs.archive_url }}" ]; then
               URL="${{ github.event.inputs.archive_url }}"; RAW="$(basename "${URL%%\?*}")"
             else
               FILE="$(ls input/* 2>/dev/null | head -n1 || true)"; RAW="$(basename "$FILE")"
@@ -255,7 +250,7 @@ jobs:
           else
             RAW="scan"
           fi
-          SAN_LABEL="$(echo "${RAW}" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
+          SAN_LABEL="$(echo "$RAW" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
           [ -z "$SAN_LABEL" ] && SAN_LABEL="scan"
           SAN_LABEL="${SAN_LABEL:0:80}"
 
@@ -264,13 +259,39 @@ jobs:
           echo "IMAGE_NAME=$SAN_LABEL" >> "$GITHUB_ENV"
           echo "🧾 Artifact base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
 
-      # -------------------- SCANOSS (Docker) — choose mode --------------------
-      - name: Run SCANOSS scan on Docker image (manual export)
+      # ---------------- Optional archive unpack (git/upload only) ----------------
+      - name: Unpack nested archives (optional)
         if: |
-          github.event.inputs.enable_scanoss == 'true' &&
-          github.event.inputs.scan_type == 'docker' &&
-          github.event.inputs.image_scan_mode == 'manual'
-        continue-on-error: true
+          github.event.inputs.unpack_archives == 'true' &&
+          (github.event.inputs.scan_type == 'git' || github.event.inputs.scan_type == 'upload-zip' ||
+           (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true'))
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_DIR="${SCAN_DIR:-repo-to-scan}"
+          [ -z "$BASE_DIR" ] && BASE_DIR="repo-to-scan"
+          mkdir -p expanded
+          rsync -a "$BASE_DIR"/ expanded/ || true
+          # Unpack jar/war/zip
+          find "$BASE_DIR" -type f \( -iname '*.jar' -o -iname '*.war' -o -iname '*.zip' \) | while read -r f; do
+            rel="${f#$BASE_DIR/}"; out="expanded/${rel}.extracted"
+            mkdir -p "$out"; unzip -oq "$f" -d "$out" || true
+          done
+          # Unpack tar/tar.gz/tar.xz
+          find "$BASE_DIR" -type f \( -iname '*.tar' -o -iname '*.tgz' -o -iname '*.tar.gz' -o -iname '*.txz' -o -iname '*.tar.xz' \) | while read -r f; do
+            rel="${f#$BASE_DIR/}"; out="expanded/${rel}.extracted"
+            mkdir -p "$out"
+            case "$f" in
+              *.tar.gz|*.tgz)  tar -xzf "$f" -C "$out" || true ;;
+              *.tar.xz|*.txz)  tar -xJf "$f" -C "$out" || true ;;
+              *.tar)           tar -xf  "$f" -C "$out" || true ;;
+            esac
+          done
+          echo "SCAN_DIR=expanded" >> "$GITHUB_ENV"
+
+      # ------------------------- SCANOSS (manual) -------------------------
+      - name: Run SCANOSS scan (Docker manual merged rootfs)
+        if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -281,23 +302,11 @@ jobs:
           tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS scan on Docker image (syft container-scan)
-        if: |
-          github.event.inputs.enable_scanoss == 'true' &&
-          github.event.inputs.scan_type == 'docker' &&
-          github.event.inputs.image_scan_mode == 'syft'
-        continue-on-error: true
-        run: |
-          scanoss-py container-scan "$DOCKER_IMAGE_REF" -o "scanoss_${SCAN_LABEL}.json"
-
-      # ------------- SCANOSS (Auto-built image for git/upload) --------------
-      - name: Run SCANOSS on auto-built image (manual export)
+      - name: Run SCANOSS scan (Auto-built image from git/upload)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
           github.event.inputs.scan_type != 'docker' &&
-          steps.autodock.outputs.has_image == 'true' &&
-          github.event.inputs.image_scan_mode == 'manual'
-        continue-on-error: true
+          steps.autodock.outputs.has_image == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -309,51 +318,21 @@ jobs:
           tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS on auto-built image (syft container-scan)
-        if: |
-          github.event.inputs.enable_scanoss == 'true' &&
-          github.event.inputs.scan_type != 'docker' &&
-          steps.autodock.outputs.has_image == 'true' &&
-          github.event.inputs.image_scan_mode == 'syft'
-        continue-on-error: true
-        run: |
-          scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${SCAN_LABEL}.json"
-
-      # -------------------- SCANOSS (Directory) --------------------
-      - name: Run SCANOSS scan on directory (git/upload)
+      - name: Run SCANOSS scan (Directory: git/upload)
         if: |
           github.event.inputs.enable_scanoss == 'true' &&
           (
-            (github.event.inputs.scan_type == 'git'        && steps.autodock.outputs.has_image == 'false') ||
-            (github.event.inputs.scan_type == 'upload-zip' && steps.autodock.outputs.has_image == 'false') ||
-            (github.event.inputs.scan_type == 'upload-tar' && steps.autodock.outputs.has_image == 'false')
+            (github.event.inputs.scan_type == 'git') ||
+            (github.event.inputs.scan_type == 'upload-zip') ||
+            (github.event.inputs.scan_type == 'upload-tar' && env.IS_IMAGE_TAR != 'true')
           )
-        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          TARGET_DIR=""
-          if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then TARGET_DIR="repo-to-scan"; fi
-          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
-          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
-          scanoss-py scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
+          TARGET="${SCAN_DIR:-repo-to-scan}"
+          scanoss-py scan -d "$TARGET" -o "scanoss_${SCAN_LABEL}.json"
 
-      # ----------------------- Inspect SCANOSS JSON (debug) -----------------------
-      - name: Inspect SCANOSS JSON (debug)
-        shell: bash
-        run: |
-          set -euo pipefail
-          F="scanoss_${SCAN_LABEL}.json"
-          if [[ -f "$F" ]]; then
-            echo "File: $F"
-            echo "Size: $(wc -c < "$F") bytes"
-            echo "Preview:"
-            head -c 2000 "$F" | sed 's/[^[:print:]\t]/?/g'
-          else
-            echo "JSON not found."
-          fi
-
-      # ---------------- SCANOSS JSON ➜ Excel (always write) ----------------
+      # ------------------------- Excel conversion -------------------------
       - name: Build SCANOSS Excel
         shell: bash
         run: |
@@ -365,82 +344,141 @@ jobs:
           xlsx_main  = f"{scan_label}_scanoss_components_report.xlsx"
           xlsx_merged= f"{scan_label}_compliance_merged_report.xlsx"
 
-          rows = []
+          files_rows, lic_rows, cr_rows = [], [], []
+          def coalesce(*vals):
+            for v in vals:
+              if v not in (None, "", []): return v
+            return None
+          def as_list(x):
+            if x is None: return []
+            return x if isinstance(x, list) else [x]
+
           if os.path.exists(out_json):
-            try:
-              with open(out_json, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            except Exception as e:
-              data = None
-            def add_row(file_path=None, component=None, version=None, license_=None, url=None, purl=None, vendor=None, extra=None):
-              rows.append({
-                "file": file_path, "component": component, "version": version,
-                "license": license_, "url": url, "purl": purl, "vendor": vendor, "extra": extra
+            with open(out_json, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+            # Accept three shapes:
+            # 1) dict mapping file->list(findings)
+            # 2) dict with "files"/"identified"
+            # 3) list of file objects
+            def handle_file_entry(fpath, entry):
+              comp = entry.get("component") or entry.get("name")
+              ver  = entry.get("version")
+              health = entry.get("health") or {}
+              # Flatten licenses summary (names & sources joined)
+              lic_names = []
+              lic_sources = []
+              lic_urls = []
+              chk_urls = []
+              for L in as_list(entry.get("licenses")):
+                if not isinstance(L, dict): continue
+                if L.get("name"): lic_names.append(str(L.get("name")))
+                if L.get("source"): lic_sources.append(str(L.get("source")))
+                if L.get("url"): lic_urls.append(str(L.get("url")))
+                if L.get("checklist_url"): chk_urls.append(str(L.get("checklist_url")))
+                lic_rows.append({
+                  "file": fpath, "component": comp, "version": ver,
+                  "license_name": L.get("name"),
+                  "source": L.get("source"),
+                  "copyleft": L.get("copyleft"),
+                  "patent_hints": L.get("patent_hints"),
+                  "incompatible_with": L.get("incompatible_with"),
+                  "spdx_url": L.get("url"),
+                  "checklist_url": L.get("checklist_url"),
+                  "osadl_updated": L.get("osadl_updated"),
+                })
+              # Copyrights detail
+              for C in as_list(entry.get("copyrights")):
+                if not isinstance(C, dict): continue
+                cr_rows.append({
+                  "file": fpath, "component": comp,
+                  "copyright": C.get("name"),
+                  "source": C.get("source"),
+                })
+              files_rows.append({
+                "file": fpath,
+                "component": comp,
+                "version": ver,
+                "licenses": "; ".join(lic_names) if lic_names else None,
+                "license_sources": "; ".join(sorted(set(lic_sources))) if lic_sources else None,
+                "license_urls": "; ".join(sorted(set(lic_urls))) if lic_urls else None,
+                "checklist_urls": "; ".join(sorted(set(chk_urls))) if chk_urls else None,
+                "file_hash": entry.get("file_hash"),
+                "file_url": entry.get("file_url"),
+                "health_stars": health.get("stars"),
+                "health_forks": health.get("forks"),
+                "health_issues": health.get("issues"),
+                "health_creation_date": health.get("creation_date"),
+                "health_last_push": health.get("last_push"),
+                "health_last_update": health.get("last_update"),
+                "latest": entry.get("latest"),
+                "id": entry.get("id"),
+                "match_count": len(as_list(entry.get("licenses"))) + len(as_list(entry.get("copyrights"))),
               })
-            if isinstance(data, dict):
-              files = data.get("files") or data.get("identified") or []
+
+            if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()) and any("/" in k or k.startswith((".", "/")) or k == os.path.basename(k) for k in data.keys()):
+              # Shape 1: {"path":[findings]}
+              for fpath, lst in data.items():
+                for entry in as_list(lst):
+                  if isinstance(entry, dict):
+                    handle_file_entry(fpath, entry)
+            else:
+              files = None
+              if isinstance(data, dict):
+                files = data.get("files") or data.get("identified")
+              if files is None and isinstance(data, list):
+                files = data
               if isinstance(files, list):
                 for f in files:
-                  fpath = f.get("file") or f.get("path")
-                  oss_lines = f.get("oss_lines") or f.get("oss") or []
-                  if isinstance(oss_lines, list):
-                    for line in oss_lines:
-                      dets = line.get("oss") if isinstance(line, dict) else None
-                      dets = dets if isinstance(dets, list) else ([line] if isinstance(line, dict) else [])
-                      for d in dets or []:
-                        if not isinstance(d, dict): continue
-                        keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
-                        add_row(fpath, d.get("component") or d.get("name"), d.get("version"),
-                                d.get("license") or d.get("licenses"),
-                                d.get("url") or d.get("homepage"), d.get("purl"), d.get("vendor"),
-                                json.dumps(keep, ensure_ascii=False) or None)
-              comps = data.get("components")
-              if isinstance(comps, list):
-                for d in comps:
-                  if not isinstance(d, dict): continue
-                  keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
-                  rows.append({
-                    "file": None,
-                    "component": d.get("component") or d.get("name"),
-                    "version": d.get("version"),
-                    "license": d.get("license") or d.get("licenses"),
-                    "url": d.get("url") or d.get("homepage"),
-                    "purl": d.get("purl"),
-                    "vendor": d.get("vendor"),
-                    "extra": json.dumps(keep, ensure_ascii=False) or None
-                  })
-            elif isinstance(data, list):
-              for f in data:
-                if not isinstance(f, dict): continue
-                fpath = f.get("file") or f.get("path")
-                dets = f.get("oss") or f.get("components") or []
-                if isinstance(dets, list):
-                  for d in dets:
-                    if not isinstance(d, dict): continue
-                    keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
-                    rows.append({
-                      "file": fpath,
-                      "component": d.get("component") or d.get("name"),
-                      "version": d.get("version"),
-                      "license": d.get("license") or d.get("licenses"),
-                      "url": d.get("url") or d.get("homepage"),
-                      "purl": d.get("purl"),
-                      "vendor": d.get("vendor"),
-                      "extra": json.dumps(keep, ensure_ascii=False) or None
-                    })
+                  if not isinstance(f, dict): continue
+                  fpath = coalesce(f.get("file"), f.get("path"))
+                  for entry in as_list(f.get("oss") or f.get("components") or f.get("oss_lines")):
+                    if isinstance(entry, dict):
+                      # Some shapes embed per-line dicts containing "oss": [...]
+                      entries = entry.get("oss") if "oss" in entry and isinstance(entry["oss"], list) else [entry]
+                      for e in entries:
+                        if isinstance(e, dict): handle_file_entry(fpath, e)
 
-          df = pd.DataFrame(rows)
+          df_find = pd.DataFrame(files_rows)
+          df_lic  = pd.DataFrame(lic_rows)
+          df_cr   = pd.DataFrame(cr_rows)
+
+          # Summary
+          sums = []
+          if not df_find.empty:
+            top_comp = df_find.groupby(["component"], dropna=True)["file"].count().reset_index().sort_values("file", ascending=False).rename(columns={"file":"count"})
+            top_comp.insert(0, "Category", "Top Components")
+            sums.append(top_comp.head(50))
+            if "licenses" in df_find:
+              lic_exp = df_find["licenses"].dropna().str.split(r'\s*;\s*').explode()
+              if not lic_exp.empty:
+                top_lic = lic_exp.value_counts().reset_index()
+                top_lic.columns = ["license_name", "count"]
+                top_lic.insert(0, "Category", "Top Licenses")
+                sums.append(top_lic.head(50))
+          totals = pd.DataFrame([{
+            "files_with_findings": int(df_find["file"].nunique()) if not df_find.empty else 0,
+            "components_detected": int(df_find["component"].nunique()) if not df_find.empty else 0,
+            "unique_licenses": int(df_lic["license_name"].nunique()) if not df_lic.empty else 0
+          }])
+          totals.insert(0, "Category", "Totals")
+          sums.insert(0, totals)
+          df_summary = pd.concat(sums, ignore_index=True) if sums else totals
+
           with pd.ExcelWriter(xlsx_main) as w:
-            if not df.empty:
-              df.to_excel(w, "SCANOSS_Components", index=False)
-            else:
-              pd.DataFrame([{"status":"No detections or scan returned no results"}]).to_excel(w, "Summary", index=False)
+            (df_find if not df_find.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Findings", index=False)
+            if not df_lic.empty: df_lic.to_excel(w, "Licenses_Detail", index=False)
+            if not df_cr.empty:  df_cr.to_excel(w, "Copyrights_Detail", index=False)
+            df_summary.to_excel(w, "Summary", index=False)
+
+          # Keep compatibility artifact
           with pd.ExcelWriter(xlsx_merged) as w:
-            (df if not df.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
-          print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
+            (df_find if not df_find.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
+
+          print(f"✅ XLSX written: {xlsx_main} / {xlsx_merged} • rows={len(df_find)}")
           PY
 
-      # -------------------------- Upload artifacts --------------------------
+      # ------------------------- Upload artifacts -------------------------
       - name: Upload Compliance Artifacts
         uses: actions/upload-artifact@v4
         with:
