@@ -214,7 +214,7 @@ if scan_type == "git":
                 if terr:
                     st.error(f"Tags API error: {terr}")
                 if not (branches or tags) and not (berr or terr):
-                    st.warning("No branches or tags returned. The repo may be empty or rate limited.")
+                    st.warning("No branches or tags returned. The repo may be empty, private without access, or rate limited.")
             else:
                 st.warning("Enter a valid GitHub repo (owner/repo, HTTPS, or SSH) before loading refs.")
 
@@ -242,7 +242,6 @@ if scan_type == "git":
         st.session_state.get("source_input", ""), effective_ref
     )
     st.caption(f"🔧 Repo URL (normalized): {_norm_url or '(none)'} | Ref: {effective_ref or _resolved_ref or '(none)'}")
- {_norm_url or '(none)'} | Ref: {_resolved_ref or '(none)'}")
 
 elif scan_type in ("upload-zip", "upload-tar"):
     c1, _ = st.columns([3, 2])
