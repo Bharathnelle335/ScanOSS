@@ -2,32 +2,16 @@ import streamlit as st
 import requests
 from datetime import datetime
 
+# ----------------------- Page Config -----------------------
 st.set_page_config(page_title="SCANOSS Workflow Trigger", page_icon="🧩", layout="wide")
+
 st.title("🧩 SCANOSS Workflow Trigger")
 st.caption("© EY Internal Use Only")
 
 # ----------------------- Sidebar Config -----------------------
 with st.sidebar:
-    st.header("Repo Config")
-    owner = st.text_input("GitHub Owner", value="Bharathnelle335")
-    repo = st.text_input("Repository", value="Universal-OSS-Compliance")
-    workflow_file = st.text_input("Workflow file name", value="scancode.yml")
-    ref = st.text_input("Ref (branch/tag)", value="main")
-    
-    if st.button("🔄 Load branches/tags"):
-        try:
-            url_branches = f"https://api.github.com/repos/{owner}/{repo}/branches"
-            url_tags = f"https://api.github.com/repos/{owner}/{repo}/tags"
-            branches = requests.get(url_branches, headers={"Authorization": f"Bearer {st.secrets['GITHUB_TOKEN']}"}).json()
-            tags = requests.get(url_tags, headers={"Authorization": f"Bearer {st.secrets['GITHUB_TOKEN']}"}).json()
-            branch_names = [b.get("name") for b in branches if isinstance(b, dict)]
-            tag_names = [t.get("name") for t in tags if isinstance(t, dict)]
-            choices = branch_names + tag_names
-            if choices:
-                ref = st.selectbox("Select branch/tag", choices, index=0)
-        except Exception as e:
-            st.error(f"Failed to load branches/tags: {e}")
-
+    st.header("Workflow Config")
+    workflow_file = st.text_input("Workflow file name", value="ScanOSS.yml")
     st.markdown("---")
     st.caption("Auth: uses `st.secrets['GITHUB_TOKEN']`. Create a classic PAT with repo/workflow access.")
 
@@ -42,6 +26,9 @@ session.headers.update({
     "Authorization": f"Bearer {TOKEN}" if TOKEN else "",
     "X-GitHub-Api-Version": "2022-11-28",
 })
+
+OWNER = "Bharathnelle335"
+REPO = "scanOSS"
 
 def dispatch_workflow(owner: str, repo: str, workflow_file: str, ref: str, inputs: dict):
     url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_file}/dispatches"
@@ -67,10 +54,31 @@ def find_run_by_client_tag(runs: list, client_run_id: str):
             return run
     return None
 
+def list_branches_and_tags(owner: str, repo: str):
+    branches_url = f"https://api.github.com/repos/{owner}/{repo}/branches?per_page=50"
+    tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=50"
+    branches, tags = [], []
+    rb = session.get(branches_url, timeout=30)
+    rt = session.get(tags_url, timeout=30)
+    if rb.ok:
+        branches = [b["name"] for b in rb.json()]
+    if rt.ok:
+        tags = [t["name"] for t in rt.json()]
+    return branches, tags
+
 # ----------------------- Main Form -----------------------
 st.subheader("Dispatch inputs")
-colA, colB = st.columns(2)
 
+# Git refs
+branches, tags = [], []
+if st.button("🔄 Load branches/tags"):
+    branches, tags = list_branches_and_tags(OWNER, REPO)
+    if not (branches or tags):
+        st.warning("No branches or tags found, or token missing access.")
+
+ref_choice = st.selectbox("Select branch/tag (ref)", ["main"] + branches + tags)
+
+colA, colB = st.columns(2)
 with colA:
     scan_type = st.selectbox("scan_type", ["docker", "git", "upload-zip", "upload-tar"], index=0)
     image_scan_mode = st.selectbox("image_scan_mode (for images)", ["manual", "syft"], index=0)
@@ -78,7 +86,8 @@ with colA:
     enable_scanoss = "true" if enable_scanoss_bool else "false"
 
 with colB:
-    client_run_id = st.text_input("client_run_id (optional tag)", value=datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
+    client_run_id = st.text_input("client_run_id (optional tag)",
+                                  value=datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
 
 # Conditional inputs
 docker_image = ""
@@ -104,7 +113,6 @@ elif scan_type in ("upload-zip", "upload-tar"):
 
 # ----------------------- Submit -----------------------
 col1, col2, col3 = st.columns([1,1,2])
-
 with col1:
     go = st.button("🚀 Dispatch Workflow")
 with col2:
@@ -135,7 +143,7 @@ if go:
             "client_run_id": client_run_id,
         }
         try:
-            r = dispatch_workflow(owner, repo, workflow_file, ref, inputs)
+            r = dispatch_workflow(OWNER, REPO, workflow_file, ref_choice, inputs)
             if r.status_code in (201, 202, 204):
                 status_box.success("✅ Dispatched! Open your repo's Actions tab to watch the run.")
             else:
@@ -144,7 +152,7 @@ if go:
             status_box.error(f"❌ Exception while dispatching: {e}")
 
 if chk:
-    runs = list_recent_runs(owner, repo, per_page=30)
+    runs = list_recent_runs(OWNER, REPO, per_page=30)
     run = find_run_by_client_tag(runs, client_run_id)
     if not run:
         st.info("No recent run found with this client_run_id in its run name. It may still be starting.")
@@ -168,16 +176,13 @@ if chk:
                     if arts:
                         st.subheader("Artifacts")
                         for a in arts:
-                            st.write(f"• **{a.get('name')}**  (size: {a.get('size_in_bytes')} bytes, expired: {a.get('expired')})")
+                            st.write(f"• **{a.get('name')}**  ({a.get('size_in_bytes')} bytes)")
                             dl = a.get("archive_download_url")
                             if dl:
                                 st.code(dl, language="text")
                     else:
-                        st.caption("No artifacts on this run yet (or not uploaded).")
+                        st.caption("No artifacts on this run yet.")
                 else:
                     st.caption(f"Could not list artifacts: {ar.status_code}")
             except Exception as e:
                 st.caption(f"Artifacts lookup error: {e}")
-
-st.markdown("---")
-st.caption("Tip: For `upload-zip` or `upload-tar`, provide a direct-download URL. For GitHub repos, you can use `.../archive/refs/heads/main.zip` or `.tar.gz`.")
