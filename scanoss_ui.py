@@ -12,13 +12,13 @@ st.caption("© EY Internal Use Only")
 # ----------------------- Sidebar Config -----------------------
 with st.sidebar:
     st.header("Repo Config")
-    # Single field only (owner removed). Accepts either "owner/name" or just "name".
-    repo_input = st.text_input("Repository (owner/name or name)", value="Universal-OSS-Compliance")
-    workflow_file = st.text_input("Workflow file name", value="scancode.yml")
-    ref = st.text_input("Ref (branch/tag)", value="main")
+    # One field only (owner removed). Accepts either "owner/name" or just "name".
+    repo_input = st.text_input("Repository (owner/name or name)", value="Universal-OSS-Compliance", key="repo_input")
+    workflow_file = st.text_input("Workflow file name", value="scancode.yml", key="workflow_file")
+    st.text_input("Ref (branch/tag)", value="main", key="ref_input")
 
     st.markdown("---")
-    st.caption("Auth: uses `st.secrets['GITHUB_TOKEN']`. Create a classic PAT with repo/workflow access.")
+    st.caption("Auth: uses `st.secrets['GITHUB_TOKEN']`. Create a classic PAT with repo + workflow scopes, or a fine‑grained token with Actions: Read/Write and Contents: Read.")
 
 # ----------------------- Helpers -----------------------
 TOKEN = st.secrets.get("GITHUB_TOKEN", "")
@@ -32,7 +32,18 @@ session.headers.update({
     "X-GitHub-Api-Version": "2022-11-28",
 })
 
-DEFAULT_OWNER = "Bharathnelle335"  # owner input removed; fallback owner
+# Obtain the authenticated login to use as default owner if user doesn't supply one
+_auth_login = None
+_auth_scopes_hdr = ""
+try:
+    ur = session.get("https://api.github.com/user", timeout=20)
+    if ur.ok:
+        _auth_login = ur.json().get("login")
+    _auth_scopes_hdr = ur.headers.get("X-OAuth-Scopes", "")
+except Exception:
+    pass
+
+DEFAULT_OWNER = _auth_login or "Bharathnelle335"
 
 def owner_repo_from_repo_input(repo_input: str):
     """Accepts 'owner/name' or 'name'. Returns (owner, name)."""
@@ -91,7 +102,11 @@ def fetch_refs(owner: str, repo: str, max_items: int = 100):
     tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags"
     branches = []
     tags = []
+    default_branch = None
     try:
+        rr = session.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=30)
+        if rr.ok:
+            default_branch = rr.json().get("default_branch")
         rb = session.get(branches_url, params={"per_page": max_items}, timeout=60)
         if rb.ok:
             branches = [b.get("name") for b in rb.json() if isinstance(b, dict)]
@@ -100,7 +115,20 @@ def fetch_refs(owner: str, repo: str, max_items: int = 100):
             tags = [t.get("name") for t in rt.json() if isinstance(t, dict)]
     except Exception:
         pass
-    return branches, tags
+    return branches, tags, default_branch
+
+
+def workflow_exists_on_ref(owner: str, repo: str, workflow_file: str, ref: str) -> bool:
+    # Check via contents API on the specific ref
+    try:
+        r = session.get(
+            f"https://api.github.com/repos/{owner}/{repo}/contents/.github/workflows/{workflow_file}",
+            params={"ref": ref},
+            timeout=30,
+        )
+        return r.status_code == 200
+    except Exception:
+        return False
 
 # ----------------------- Main Form -----------------------
 st.subheader("Dispatch inputs")
@@ -128,19 +156,43 @@ elif scan_type == "git":
 
     # Auto-detect branches/tags section
     st.markdown("**Auto-detect branches/tags**")
-    ref_col1, ref_col2 = st.columns([1,1])
+    ref_col1, ref_col2, ref_col3 = st.columns([1,1,1])
     with ref_col1:
         load_refs = st.button("🔄 Load branches/tags")
+    with ref_col2:
+        preflight = st.button("🧪 Preflight Check")
+    with ref_col3:
+        st.caption(f"Token scopes: {_auth_scopes_hdr or 'unknown'}")
+
     detected_ref_hint = None
     owner_from_url, repo_from_url, ref_hint = parse_git_url(git_url)
     if ref_hint:
         detected_ref_hint = ref_hint
 
     if load_refs and owner_from_url and repo_from_url:
-        branches, tags = fetch_refs(owner_from_url, repo_from_url)
+        branches, tags, default_branch = fetch_refs(owner_from_url, repo_from_url)
         st.session_state["__branches__"] = branches
         st.session_state["__tags__"] = tags
+        if default_branch and (st.session_state.get("ref_input") in (None, "", "main")):
+            st.session_state["ref_input"] = default_branch
         st.success(f"Loaded {len(branches)} branches and {len(tags)} tags from {owner_from_url}/{repo_from_url}")
+    elif load_refs and not (owner_from_url and repo_from_url):
+        st.error("Enter a valid GitHub URL or owner/repo first.")
+
+    if preflight:
+        owner, repo = owner_repo_from_repo_input(st.session_state.get("repo_input", ""))
+        ref = st.session_state.get("ref_input", "main")
+        # Basic repo visibility
+        rr = session.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=30)
+        if rr.status_code == 404:
+            st.error("Repo not found or token lacks access (404). Ensure the owner/repo is correct and the token has access.")
+        else:
+            st.success(f"Repo OK: {owner}/{repo}")
+            # Workflow presence on ref
+            if workflow_exists_on_ref(owner, repo, st.session_state.get("workflow_file", "scancode.yml"), ref):
+                st.success(f"Workflow file found on ref '{ref}'.")
+            else:
+                st.error("Workflow file not found on this ref. Ensure the exact filename exists under .github/workflows/ on that branch/tag.")
 
     branches = st.session_state.get("__branches__", [])
     tags = st.session_state.get("__tags__", [])
@@ -152,7 +204,7 @@ elif scan_type == "git":
     if tags:
         sel_tag = st.selectbox("Select tag", [""] + tags, index=0)
 
-    manual_ref = st.text_input("Manual ref override (branch/tag/commit)", value=detected_ref_hint or "")
+    manual_ref = st.text_input("Manual ref override (branch/tag/commit)", value=detected_ref_hint or st.session_state.get("ref_input", ""))
 
     # Decide final git_ref priority: manual > selected branch > selected tag > empty
     git_ref = manual_ref or sel_branch or sel_tag or ""
@@ -180,6 +232,7 @@ status_box = st.empty()
 
 if go:
     err = None
+    ref = st.session_state.get("ref_input", "main")
     if scan_type == "docker" and not docker_image:
         err = "docker_image is required for scan_type=docker"
     if scan_type == "git" and not git_url:
@@ -197,10 +250,12 @@ if go:
             "docker_image": docker_image,
             "git_url": git_url,
             "git_ref": git_ref,
-            "enable_scanoss": enable_scanoss,
+            "enable_scanoss": "true" if enable_scanoss_bool else "false",
             "archive_url": archive_url,
-            "client_run_id": client_run_id,
+            "client_run_id": st.text_input if False else st.session_state.get("client_run_id", ""),
         }
+        # Provide client_run_id explicitly (not via session key above)
+        inputs["client_run_id"] = st.session_state.get("client_run_id_override", "") or (datetime.utcnow().strftime("run-%Y%m%d-%H%M%S"))
         try:
             r = dispatch_workflow(owner, repo, workflow_file, ref, inputs)
             if r.status_code in (201, 202, 204):
@@ -213,7 +268,7 @@ if go:
 if chk:
     owner, repo = owner_repo_from_repo_input(repo_input)
     runs = list_recent_runs(owner, repo, per_page=30)
-    run = find_run_by_client_tag(runs, client_run_id)
+    run = find_run_by_client_tag(runs, st.session_state.get("client_run_id_override", ""))
     if not run:
         st.info("No recent run found with this client_run_id in its run name. It may still be starting.")
     else:
