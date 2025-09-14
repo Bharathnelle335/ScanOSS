@@ -1,4 +1,4 @@
-name: OSS Compliance - SCANOSS (Docker/Git/Upload) • manual or syft
+name: OSS Compliance - SCANOSS with syft output(Docker/Git/Upload) • manual or syft
 
 run-name: >-
   SCANOSS ${{ github.event.inputs.scan_type }} •
