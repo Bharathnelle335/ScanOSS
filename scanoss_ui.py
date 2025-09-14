@@ -21,7 +21,7 @@ HEADERS = {
 
 # ===================== PAGE ===================== #
 st.set_page_config(page_title="SCANOSS Workflow Trigger", page_icon="🧩", layout="wide")
-st.title("🧩 SCANOSS Workflow Trigger")
+st.title("SCANOSS Scanner")
 st.caption("© EY Internal Use Only")
 
 if not TOKEN:
