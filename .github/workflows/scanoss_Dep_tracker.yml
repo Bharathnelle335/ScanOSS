@@ -397,84 +397,39 @@ jobs:
           print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
           PY
 
-      - name: Build CycloneDX SBOM from SCANOSS JSON
+      - name: Generate CycloneDX directly with SCANOSS (no custom parser)
         shell: bash
         run: |
           set -euo pipefail
           OUT="scanoss_${SCAN_LABEL}.cdx.json"
-          python3 - <<'PY'
-          import json, os, uuid, datetime
-          scan_label = os.environ.get("SCAN_LABEL","scan")
-          in_path = f"scanoss_{scan_label}.json"
-          out_path = f"scanoss_{scan_label}.cdx.json"
-          comps, seen = [], set()
-          def norm_lic(x):
-            if not x: return None
-            s = str(x).strip()
-            if not s: return None
-            return {"license": {"name": s}}
-          if os.path.exists(in_path) and os.path.getsize(in_path) > 0:
-            with open(in_path, "r", encoding="utf-8") as f:
-              data = json.load(f)
-            def add(name, version, purl, lic, vendor):
-              key = (purl or f"{name}@{version}" or name or "") + (vendor or "")
-              if not key or key in seen: return
-              seen.add(key)
-              c = {"type":"library"}
-              if name: c["name"] = str(name)
-              if version: c["version"] = str(version)
-              if purl: c["purl"] = str(purl)
-              if lic: c["licenses"] = [lic]
-              if vendor: c["publisher"] = str(vendor)
-              comps.append(c)
-            if isinstance(data, dict):
-              files = data.get("files") or data.get("identified") or []
-              if isinstance(files, list):
-                for f in files:
-                  dets = f.get("oss_lines") or f.get("oss") or []
-                  if isinstance(dets, list):
-                    for line in dets:
-                      dlist = line.get("oss") if isinstance(line, dict) else None
-                      if isinstance(dlist, list):
-                        for d in dlist:
-                          if isinstance(d, dict):
-                            add(d.get("component") or d.get("name"),
-                                d.get("version"), d.get("purl"),
-                                norm_lic(d.get("license") or d.get("licenses")),
-                                d.get("vendor"))
-              comps_list = data.get("components")
-              if isinstance(comps_list, list):
-                for d in comps_list:
-                  if isinstance(d, dict):
-                    add(d.get("component") or d.get("name"),
-                        d.get("version"), d.get("purl"),
-                        norm_lic(d.get("license") or d.get("licenses")),
-                        d.get("vendor"))
-            elif isinstance(data, list):
-              for f in data:
-                if isinstance(f, dict):
-                  for d in (f.get("oss") or f.get("components") or []):
-                    if isinstance(d, dict):
-                      add(d.get("component") or d.get("name"),
-                          d.get("version"), d.get("purl"),
-                          norm_lic(d.get("license") or d.get("licenses")),
-                          d.get("vendor"))
-          bom = {
-            "bomFormat": "CycloneDX",
-            "specVersion": "1.5",
-            "version": 1,
-            "serialNumber": "urn:uuid:" + str(uuid.uuid4()),
-            "metadata": {
-              "timestamp": datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z",
-              "tools": [{"vendor":"SCANOSS","name":"scanoss-py","version":""}],
-            },
-            "components": comps
-          }
-          with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(bom, f, ensure_ascii=False, indent=2)
-          print(f"✅ Wrote CycloneDX: {out_path} (components={len(comps)})")
-          PY
+
+          # Pick the same target we just scanned for JSON
+          if [[ -d docker-output/exported-rootfs ]]; then
+            TARGET="docker-output/exported-rootfs"
+          elif [[ -d repo-to-scan ]]; then
+            TARGET="repo-to-scan"
+          elif [[ -d uploaded-source ]]; then
+            TARGET="uploaded-source"
+          elif [[ -d uploaded-tar ]]; then
+            TARGET="uploaded-tar"
+          else
+            echo "❌ Could not find scan target directory." >&2
+            exit 1
+          fi
+
+          # Ask SCANOSS to emit CycloneDX directly
+          # (We redirect stdout to a file because --output/-o is not guaranteed)
+          scanoss-py scan "$TARGET" -f cyclonedx > "$OUT"
+
+          # Basic guard: fail if empty
+          if [[ ! -s "$OUT" ]]; then
+            echo "❌ CycloneDX output is empty. Check that JSON scan had components." >&2
+            exit 1
+          fi
+
           echo "CDX_PATH=$OUT" >> "$GITHUB_ENV"
+          echo "✅ Wrote $OUT ($(wc -c < "$OUT") bytes)"
+
 
       - name: Upload Compliance Artifacts
         uses: actions/upload-artifact@v4
