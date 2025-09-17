@@ -42,16 +42,6 @@ on:
         default: 'true'
         type: boolean
 
-      archive_url:
-        description: 'Remote .zip or .tar(.gz|.xz) URL (used only when scan_type is upload-zip or upload-tar)'
-        required: false
-        default: ''
-
-      client_run_id:
-        description: 'Opaque run tag from the UI (for status + artifact lookup)'
-        required: false
-        default: ''
-
 jobs:
   oss-compliance:
     runs-on: ubuntu-latest
