@@ -397,38 +397,52 @@ jobs:
           print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
           PY
 
-      - name: Generate CycloneDX directly with SCANOSS (no custom parser)
+      - name: Generate CycloneDX (handles syft & manual)
         shell: bash
         run: |
           set -euo pipefail
           OUT="scanoss_${SCAN_LABEL}.cdx.json"
+          SYFT="${{ github.event.inputs.image_scan_mode }}"
+          MODE="${{ github.event.inputs.scan_type }}"
 
-          # Pick the same target we just scanned for JSON
-          if [[ -d docker-output/exported-rootfs ]]; then
-            TARGET="docker-output/exported-rootfs"
-          elif [[ -d repo-to-scan ]]; then
-            TARGET="repo-to-scan"
-          elif [[ -d uploaded-source ]]; then
-            TARGET="uploaded-source"
-          elif [[ -d uploaded-tar ]]; then
-            TARGET="uploaded-tar"
+          if [[ "${SYFT}" == "syft" ]]; then
+            # --- image-based scan using SCANOSS container-scan ---
+            if [[ "${MODE}" == "docker" ]]; then
+              echo "▶ container-scan (docker image): $DOCKER_IMAGE_REF → CycloneDX"
+              scanoss-py container-scan "$DOCKER_IMAGE_REF" -f cyclonedx > "$OUT"
+            elif [[ "${{ steps.autodock.outputs.has_image }}" == "true" ]]; then
+              echo "▶ container-scan (auto-built image): ${{ steps.autodock.outputs.image_ref }} → CycloneDX"
+              scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -f cyclonedx > "$OUT"
+            else
+              echo "⚠️ syft mode requested but no image available; falling back to directory scan"
+              TARGET=""
+              for d in repo-to-scan uploaded-source uploaded-tar; do
+                [[ -d "$d" ]] && TARGET="$d" && break
+              done
+              [[ -z "$TARGET" ]] && { echo "❌ No directory to scan"; exit 1; }
+              scanoss-py scan "$TARGET" -f cyclonedx > "$OUT"
+            fi
           else
-            echo "❌ Could not find scan target directory." >&2
-            exit 1
+            # --- manual export (rootfs) or direct directory scan ---
+            if [[ -d docker-output/exported-rootfs ]]; then
+              echo "▶ scan (exported rootfs) → CycloneDX"
+              scanoss-py scan docker-output/exported-rootfs -f cyclonedx > "$OUT"
+            else
+              TARGET=""
+              for d in repo-to-scan uploaded-source uploaded-tar; do
+                [[ -d "$d" ]] && TARGET="$d" && break
+              done
+              [[ -z "$TARGET" ]] && { echo "❌ Could not find scan target directory."; exit 1; }
+              echo "▶ scan ($TARGET) → CycloneDX"
+              scanoss-py scan "$TARGET" -f cyclonedx > "$OUT"
+            fi
           fi
 
-          # Ask SCANOSS to emit CycloneDX directly
-          # (We redirect stdout to a file because --output/-o is not guaranteed)
-          scanoss-py scan "$TARGET" -f cyclonedx > "$OUT"
-
-          # Basic guard: fail if empty
-          if [[ ! -s "$OUT" ]]; then
-            echo "❌ CycloneDX output is empty. Check that JSON scan had components." >&2
-            exit 1
-          fi
-
+          # Guard: fail if empty
+          [[ -s "$OUT" ]] || { echo "❌ CycloneDX output is empty"; exit 1; }
           echo "CDX_PATH=$OUT" >> "$GITHUB_ENV"
           echo "✅ Wrote $OUT ($(wc -c < "$OUT") bytes)"
+
 
 
       - name: Upload Compliance Artifacts
