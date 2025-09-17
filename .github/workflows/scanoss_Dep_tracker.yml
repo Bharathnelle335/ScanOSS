@@ -1,0 +1,605 @@
+name: OSS Compliance - SCANOSS CLI (Docker/Git/Upload) • manual or syft
+
+run-name: >-
+  SCANOSS ${{ github.event.inputs.scan_type }} •
+  mode=${{ github.event.inputs.image_scan_mode }} •
+  ${{ github.event.inputs.docker_image || github.event.inputs.git_url || github.event.inputs.archive_url || 'upload' }} •
+  ${{ github.event.inputs.client_run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Scan a Docker image, Git repo, uploaded source.zip or image.tar archive'
+        required: true
+        default: 'docker'
+        type: choice
+        options: [docker, git, upload-zip, upload-tar]
+
+      image_scan_mode:
+        description: 'How to scan container images (docker/export manual vs syft-driven)'
+        required: true
+        default: 'manual'
+        type: choice
+        options: [manual, syft]
+
+      docker_image:
+        description: 'Docker image name (e.g., nginx:latest) [scan_type: docker]'
+        required: false
+
+      git_url:
+        description: 'Git repository URL (e.g., https://github.com/user/repo OR https://github.com/user/repo/tree/v1.2.3)'
+        required: false
+
+      git_ref:
+        description: 'Branch / tag / commit to scan [scan_type: git]. Leave blank if included in git_url (tree/commit/tag).'
+        required: false
+        default: ''
+
+      enable_scanoss:
+        description: 'Run SCANOSS OSS scan?'
+        required: false
+        default: 'true'
+        type: boolean
+
+      archive_url:
+        description: 'Remote .zip or .tar(.gz|.xz) URL (used only when scan_type is upload-zip or upload-tar)'
+        required: false
+        default: ''
+
+      client_run_id:
+        description: 'Opaque run tag from the UI (for status + artifact lookup)'
+        required: false
+        default: ''
+
+jobs:
+  oss-compliance:
+    runs-on: ubuntu-latest
+    env:
+      # === Required secrets ===
+      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}   # optional but recommended
+      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}   # optional private endpoint
+      DT_API_KEY:       ${{ secrets.DT_API_KEY }}       # create in Dependency-Track and add to repo secrets
+
+      # === Dependency-Track backend location (adjust port if reverse-proxied) ===
+      DT_PROTOCOL: http
+      DT_SERVER_HOST: 3.110.199.92
+      DT_PORT: 8081   # if your /api is at :80 via reverse-proxy, change to 80
+
+    steps:
+      # -------------------------- Setup --------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl unzip xz-utils tar
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install SCANOSS and Excel deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --user scanoss pandas openpyxl
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+
+      - name: Install Syft (only if image_scan_mode == syft)
+        if: ${{ github.event.inputs.image_scan_mode == 'syft' }}
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b /usr/local/bin
+          syft version
+
+      # -------- Normalize Docker image input (handles "alpine: latest") --------
+      - name: Normalize Docker image input
+        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW="${{ github.event.inputs.docker_image }}"
+          RAW_TRIM="$(echo "$RAW" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+          IMG_REF="$(echo "$RAW_TRIM" | sed -E 's/[[:space:]]*:[[:space:]]*/:/g' | tr -d '\r')"
+          if ! echo "$IMG_REF" | grep -Eq '^[[:alnum:]][[:alnum:]._/-]*(:[[:alnum:]._-]+)?(@sha256:[a-f0-9]{64})?$'; then
+            echo "❌ Invalid docker image reference after normalization: '$IMG_REF'" >&2
+            exit 1
+          fi
+          echo "DOCKER_IMAGE_REF=$IMG_REF" >> "$GITHUB_ENV"
+          echo "✅ Using Docker image: $IMG_REF"
+
+      # -------------------------- Prepare source --------------------------
+      - name: Pull Docker image
+        if: ${{ github.event.inputs.scan_type == 'docker' }}
+        run: docker pull "$DOCKER_IMAGE_REF"
+
+      - name: Clone Git repository
+        if: ${{ github.event.inputs.scan_type == 'git' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_URL="${{ github.event.inputs.git_url }}"
+          RAW_REF="${{ github.event.inputs.git_ref }}"
+          if [[ -z "${RAW_URL}" ]]; then
+            echo "❌ git_url is required when scan_type=git" >&2
+            exit 1
+          fi
+          BASE_URL=""; DET_REF=""
+          case "$RAW_URL" in
+            https://github.com/*/tree/*)
+              DET_REF="${RAW_URL##*/tree/}"; DET_REF="${DET_REF%%/*}"
+              BASE_URL="${RAW_URL%%/tree/*}.git" ;;
+            https://github.com/*/commit/*)
+              DET_REF="${RAW_URL##*/commit/}"; DET_REF="${DET_REF%%/*}"
+              BASE_URL="${RAW_URL%%/commit/*}.git" ;;
+            https://github.com/*/releases/tag/*)
+              DET_REF="${RAW_URL##*/releases/tag/}"; DET_REF="${DET_REF%%/*}"
+              BASE_URL="${RAW_URL%%/releases/tag/*}.git" ;;
+            https://github.com/*/*)
+              BASE_URL="${RAW_URL%.git}.git" ;;
+            *) BASE_URL="${RAW_URL}" ;;
+          esac
+          GIT_REF="${RAW_REF#refs/heads/}"; GIT_REF="${GIT_REF#refs/tags/}"
+          if [[ -z "${GIT_REF}" ]]; then
+            if [[ -n "${DET_REF}" ]]; then GIT_REF="${DET_REF}"; else GIT_REF="main"; fi
+          fi
+          echo "🔧 Repo: ${BASE_URL}"
+          echo "🔧 Ref:  ${GIT_REF}"
+          rm -rf repo-to-scan
+          if git ls-remote --tags --heads "${BASE_URL}" | grep -qE "refs/(heads|tags)/${GIT_REF}$"; then
+            git clone --depth 1 --branch "${GIT_REF}" "${BASE_URL}" repo-to-scan || true
+          fi
+          if [[ ! -d repo-to-scan ]]; then
+            git clone "${BASE_URL}" repo-to-scan
+            cd repo-to-scan
+            git fetch --all --tags --prune
+            git checkout --detach "${GIT_REF}" || { echo "❌ Ref not found"; exit 1; }
+            cd -
+          fi
+          echo "✔ Checked out $(cd repo-to-scan && git rev-parse --short HEAD)"
+
+      - name: Unzip uploaded source archive (or download ZIP)
+        if: ${{ github.event.inputs.scan_type == 'upload-zip' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p uploaded-source
+          URL="${{ github.event.inputs.archive_url }}"
+          if [[ -n "$URL" ]]; then
+            echo "📥 Downloading ZIP from $URL …"
+            curl -L --fail --retry 3 --retry-delay 2 "$URL" -o input.zip
+            unzip -q input.zip -d uploaded-source
+          else
+            unzip -q input/*.zip -d uploaded-source
+          fi
+
+      - name: Extract uploaded TAR archive (or download TAR)
+        if: ${{ github.event.inputs.scan_type == 'upload-tar' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p uploaded-tar
+          URL="${{ github.event.inputs.archive_url }}"
+          if [[ -n "$URL" ]]; then
+            echo "📥 Downloading TAR from $URL …"
+            curl -L --fail --retry 3 --retry-delay 2 "$URL" -o input.tar
+            SRC="input.tar"
+          else
+            SRC=$(ls input/*.tar 2>/dev/null | head -n1 || true)
+            if [[ -z "$SRC" ]]; then
+              echo "❌ No TAR found in input/ and no archive_url provided." >&2
+              exit 1
+            fi
+          fi
+          NAME="${SRC##*/}"
+          case "$NAME" in
+            *.tar.gz|*.tgz)  tar -xzf "$SRC" -C uploaded-tar ;;
+            *.tar.xz|*.txz)  tar -xJf "$SRC" -C uploaded-tar ;;
+            *.tar)           tar -xf  "$SRC" -C uploaded-tar ;;
+            *)               echo "ℹ️ Unknown TAR extension; trying generic -xf"; tar -xf "$SRC" -C uploaded-tar ;;
+          esac
+
+      # ---- Auto-detect Dockerfile & optionally build an image (non-docker modes) ----
+      - name: Detect Dockerfile and optionally build image
+        id: autodock
+        if: ${{ github.event.inputs.scan_type != 'docker' }}
+        run: |
+          set -e
+          SCAN_DIR="."
+          if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then SCAN_DIR="repo-to-scan"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then SCAN_DIR="uploaded-source"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then SCAN_DIR="uploaded-tar"; fi
+          HAS_IMAGE=false; IMAGE_REF=""
+          DF_PATH=$(find "$SCAN_DIR" -type f -iname 'Dockerfile' | head -n 1 || true)
+          if [[ -n "$DF_PATH" ]]; then
+            if docker build -t auto-scanned-image:latest "$(dirname "$DF_PATH")"; then
+              HAS_IMAGE=true; IMAGE_REF="auto-scanned-image:latest"
+              echo "✅ Docker image built"
+            else
+              echo "⚠️ Docker build failed – skipping image-based scan"
+            fi
+          else
+            echo "No Dockerfile – skip image build"
+          fi
+          echo "has_image=$HAS_IMAGE"  >> "$GITHUB_OUTPUT"
+          echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
+
+      # ---------------- Label + run tag (sanitize for artifact names) ----------------
+      - name: Set LABEL, PROJECT_NAME, PROJECT_VERSION env
+        shell: bash
+        run: |
+          set -euo pipefail
+          # RUN_TAG: client_run_id or GITHUB_RUN_ID, sanitized
+          RUN_TAG_IN="${{ github.event.inputs.client_run_id }}"
+          if [ -z "${RUN_TAG_IN}" ]; then RUN_TAG_IN="${GITHUB_RUN_ID}"; fi
+          SAN_RUN_TAG="$(echo "$RUN_TAG_IN" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
+          [ -z "$SAN_RUN_TAG" ] && SAN_RUN_TAG="${GITHUB_RUN_ID}"
+          SAN_RUN_TAG="${SAN_RUN_TAG:0:80}"
+
+          # SCAN_LABEL: from source (same logic path-aware)
+          MODE="${{ github.event.inputs.scan_type }}"
+          RAW=""
+          if [[ "$MODE" == "docker" ]]; then
+            RAW="${DOCKER_IMAGE_REF:-${{ github.event.inputs.docker_image }}}"
+          elif [[ "$MODE" == "git" ]]; then
+            RAW="${{ github.event.inputs.git_url }}"
+          elif [[ "$MODE" == "upload-zip" || "$MODE" == "upload-tar" ]]; then
+            if [[ -n "${{ github.event.inputs.archive_url }}" ]]; then
+              URL="${{ github.event.inputs.archive_url }}"; RAW="$(basename "${URL%%\?*}")"
+            else
+              FILE="$(ls input/* 2>/dev/null | head -n1 || true)"; RAW="$(basename "$FILE")"
+            fi
+            [ -z "$RAW" ] && RAW="$MODE"
+          else
+            RAW="scan"
+          fi
+          SAN_LABEL="$(echo "${RAW}" | tr '/:@\"<>|*?\r\n\\ ' '_' | tr -cd 'A-Za-z0-9._-')"
+          [ -z "$SAN_LABEL" ] && SAN_LABEL="scan"
+          SAN_LABEL="${SAN_LABEL:0:80}"
+
+          # Project name = input filename (no archive extensions)
+          NAME_BASE="${SAN_LABEL%.*}"
+          case "$SAN_LABEL" in
+            *.tar.gz|*.tgz) NAME_BASE="${SAN_LABEL%.tar.gz}";;
+            *.tar.xz|*.txz) NAME_BASE="${SAN_LABEL%.tar.xz}";;
+          esac
+
+          # Project version -> only if naturally available (docker tag/sha, git ref/sha)
+          PROJECT_VERSION=""
+          if [[ "$MODE" == "docker" ]]; then
+            if [[ "$RAW" =~ :([^@]+)$ ]]; then PROJECT_VERSION="${BASH_REMATCH[1]}"; fi
+            if [[ -z "$PROJECT_VERSION" && "$RAW" =~ @sha256:([a-f0-9]{12}) ]]; then PROJECT_VERSION="${BASH_REMATCH[1]}"; fi
+          elif [[ "$MODE" == "git" ]]; then
+            REF="${{ github.event.inputs.git_ref }}"
+            [ -z "$REF" ] && REF="$(echo "$RAW" | sed -n 's#.*/tree/\([^/?#]*\).*#\1#p; s#.*/releases/tag/\([^/?#]*\).*#\1#p; s#.*/commit/\([^/?#]*\).*#\1#p' | head -n1)"
+            if [[ -n "$REF" ]]; then PROJECT_VERSION="$REF"; elif [[ -d repo-to-scan ]]; then PROJECT_VERSION="$(cd repo-to-scan && git rev-parse --short HEAD)"; fi
+          fi
+
+          echo "SCAN_LABEL=$SAN_LABEL"        >> "$GITHUB_ENV"
+          echo "RUN_TAG=$SAN_RUN_TAG"         >> "$GITHUB_ENV"
+          echo "PROJECT_NAME=$NAME_BASE"      >> "$GITHUB_ENV"
+          echo "PROJECT_VERSION=$PROJECT_VERSION" >> "$GITHUB_ENV"
+          echo "🧾 Artifacts base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
+
+      # -------------------- SCANOSS (Docker) — choose mode --------------------
+      - name: Run SCANOSS scan on Docker image (manual export)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type == 'docker' &&
+          github.event.inputs.image_scan_mode == 'manual'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docker-output/exported-rootfs
+          CID="$(docker create "$DOCKER_IMAGE_REF" /bin/true)"
+          docker export "$CID" -o docker-output/rootfs.tar
+          docker rm "$CID" >/dev/null
+          tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+          chmod -R a+rX docker-output/exported-rootfs || true
+          scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
+
+      - name: Run SCANOSS scan on Docker image (syft container-scan)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type == 'docker' &&
+          github.event.inputs.image_scan_mode == 'syft'
+        continue-on-error: true
+        run: |
+          scanoss-py container-scan "$DOCKER_IMAGE_REF" -o "scanoss_${SCAN_LABEL}.json"
+
+      # ------------- SCANOSS (Auto-built image for git/upload) --------------
+      - name: Run SCANOSS on auto-built image (manual export)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type != 'docker' &&
+          steps.autodock.outputs.has_image == 'true' &&
+          github.event.inputs.image_scan_mode == 'manual'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG_REF="${{ steps.autodock.outputs.image_ref }}"
+          mkdir -p docker-output/exported-rootfs
+          CID="$(docker create "$IMG_REF" /bin/true)"
+          docker export "$CID" -o docker-output/rootfs.tar
+          docker rm "$CID" >/dev/null
+          tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
+          chmod -R a+rX docker-output/exported-rootfs || true
+          scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
+
+      - name: Run SCANOSS on auto-built image (syft container-scan)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          github.event.inputs.scan_type != 'docker' &&
+          steps.autodock.outputs.has_image == 'true' &&
+          github.event.inputs.image_scan_mode == 'syft'
+        continue-on-error: true
+        run: |
+          scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${SCAN_LABEL}.json"
+
+      # -------------------- SCANOSS (Directory) --------------------
+      - name: Run SCANOSS scan on directory (git/upload)
+        if: |
+          github.event.inputs.enable_scanoss == 'true' &&
+          (
+            (github.event.inputs.scan_type == 'git'        && steps.autodock.outputs.has_image == 'false') ||
+            (github.event.inputs.scan_type == 'upload-zip' && steps.autodock.outputs.has_image == 'false') ||
+            (github.event.inputs.scan_type == 'upload-tar' && steps.autodock.outputs.has_image == 'false')
+          )
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_DIR=""
+          if [[ "${{ github.event.inputs.scan_type }}" == "git"        ]]; then TARGET_DIR="repo-to-scan"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-zip" ]]; then TARGET_DIR="uploaded-source"; fi
+          if [[ "${{ github.event.inputs.scan_type }}" == "upload-tar" ]]; then TARGET_DIR="uploaded-tar"; fi
+          scanoss-py scan -d "$TARGET_DIR" -o "scanoss_${SCAN_LABEL}.json"
+
+      # ----------------------- Inspect SCANOSS JSON (debug) -----------------------
+      - name: Inspect SCANOSS JSON (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          F="scanoss_${SCAN_LABEL}.json"
+          if [[ -f "$F" ]]; then
+            echo "File: $F"
+            echo "Size: $(wc -c < "$F") bytes"
+            echo "Preview:"
+            head -c 2000 "$F" | sed 's/[^[:print:]\t]/?/g'
+          else
+            echo "JSON not found."
+          fi
+
+      # ---------------- SCANOSS JSON ➜ Excel (always write) ----------------
+      - name: Build SCANOSS Excel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pandas as pd
+          scan_label = os.environ.get("SCAN_LABEL","scan")
+          out_json = f"scanoss_{scan_label}.json"
+          xlsx_main  = f"{scan_label}_scanoss_components_report.xlsx"
+          xlsx_merged= f"{scan_label}_compliance_merged_report.xlsx"
+          rows = []
+          if os.path.exists(out_json):
+            try:
+              with open(out_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            except Exception:
+              data = None
+            def add_row(file_path=None, component=None, version=None, license_=None, url=None, purl=None, vendor=None, extra=None):
+              rows.append({
+                "file": file_path, "component": component, "version": version,
+                "license": license_, "url": url, "purl": purl, "vendor": vendor, "extra": extra
+              })
+            if isinstance(data, dict):
+              files = data.get("files") or data.get("identified") or []
+              if isinstance(files, list):
+                for f in files:
+                  fpath = f.get("file") or f.get("path")
+                  oss_lines = f.get("oss_lines") or f.get("oss") or []
+                  if isinstance(oss_lines, list):
+                    for line in oss_lines:
+                      dets = line.get("oss") if isinstance(line, dict) else None
+                      dets = dets if isinstance(dets, list) else ([line] if isinstance(line, dict) else [])
+                      for d in dets or []:
+                        if not isinstance(d, dict): continue
+                        keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
+                        add_row(fpath, d.get("component") or d.get("name"), d.get("version"),
+                                d.get("license") or d.get("licenses"),
+                                d.get("url") or d.get("homepage"), d.get("purl"), d.get("vendor"),
+                                json.dumps(keep, ensure_ascii=False) or None)
+              comps = data.get("components")
+              if isinstance(comps, list):
+                for d in comps:
+                  if not isinstance(d, dict): continue
+                  keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
+                  rows.append({
+                    "file": None,
+                    "component": d.get("component") or d.get("name"),
+                    "version": d.get("version"),
+                    "license": d.get("license") or d.get("licenses"),
+                    "url": d.get("url") or d.get("homepage"),
+                    "purl": d.get("purl"),
+                    "vendor": d.get("vendor"),
+                    "extra": json.dumps(keep, ensure_ascii=False) or None
+                  })
+            elif isinstance(data, list):
+              for f in data:
+                if not isinstance(f, dict): continue
+                fpath = f.get("file") or f.get("path")
+                dets = f.get("oss") or f.get("components") or []
+                if isinstance(dets, list):
+                  for d in dets:
+                    if not isinstance(d, dict): continue
+                    keep = {k:v for k,v in d.items() if k not in {"component","name","version","license","licenses","url","homepage","purl","vendor"}}
+                    rows.append({
+                      "file": fpath,
+                      "component": d.get("component") or d.get("name"),
+                      "version": d.get("version"),
+                      "license": d.get("license") or d.get("licenses"),
+                      "url": d.get("url") or d.get("homepage"),
+                      "purl": d.get("purl"),
+                      "vendor": d.get("vendor"),
+                      "extra": json.dumps(keep, ensure_ascii=False) or None
+                    })
+          df = pd.DataFrame(rows)
+          with pd.ExcelWriter(xlsx_main) as w:
+            if not df.empty:
+              df.to_excel(w, "SCANOSS_Components", index=False)
+            else:
+              pd.DataFrame([{"status":"No detections or scan returned no results"}]).to_excel(w, "Summary", index=False)
+          with pd.ExcelWriter(xlsx_merged) as w:
+            (df if not df.empty else pd.DataFrame([{"status":"No detections"}])).to_excel(w, "Components", index=False)
+          print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
+          PY
+
+      # ---------------- SCANOSS JSON ➜ CycloneDX (minimal, deduped) ----------------
+      - name: Build CycloneDX SBOM from SCANOSS JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          IN="scanoss_${SCAN_LABEL}.json"
+          OUT="scanoss_${SCAN_LABEL}.cdx.json"
+          python3 - <<'PY'
+          import json, os, uuid, datetime
+          scan_label = os.environ.get("SCAN_LABEL","scan")
+          in_path = f"scanoss_{scan_label}.json"
+          out_path = f"scanoss_{scan_label}.cdx.json"
+          comps = []
+          seen = set()
+          def norm_lic(x):
+            if not x: return None
+            s = str(x).strip()
+            if not s: return None
+            # put as "name" to avoid asserting SPDX IDs incorrectly
+            return {"license": {"name": s}}
+          if os.path.exists(in_path) and os.path.getsize(in_path) > 0:
+            with open(in_path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+            def add(name, version, purl, lic, vendor):
+              key = purl or f"{name}@{version}"
+              if not key: return
+              if key in seen: return
+              seen.add(key)
+              c = {"type":"library"}
+              if name: c["name"] = name
+              if version: c["version"] = str(version)
+              if purl: c["purl"] = purl
+              if lic: c["licenses"] = [lic]
+              if vendor: c["publisher"] = vendor
+              comps.append(c)
+            # accept a few shapes
+            if isinstance(data, dict):
+              files = data.get("files") or data.get("identified") or []
+              if isinstance(files, list):
+                for f in files:
+                  dets = f.get("oss_lines") or f.get("oss") or []
+                  if isinstance(dets, list):
+                    for line in dets:
+                      dlist = line.get("oss") if isinstance(line, dict) else None
+                      if isinstance(dlist, list):
+                        for d in dlist:
+                          if isinstance(d, dict):
+                            add(d.get("component") or d.get("name"),
+                                d.get("version"),
+                                d.get("purl"),
+                                norm_lic(d.get("license") or d.get("licenses")),
+                                d.get("vendor"))
+              comps_list = data.get("components")
+              if isinstance(comps_list, list):
+                for d in comps_list:
+                  if isinstance(d, dict):
+                    add(d.get("component") or d.get("name"),
+                        d.get("version"),
+                        d.get("purl"),
+                        norm_lic(d.get("license") or d.get("licenses")),
+                        d.get("vendor"))
+            elif isinstance(data, list):
+              for f in data:
+                if isinstance(f, dict):
+                  for d in (f.get("oss") or f.get("components") or []):
+                    if isinstance(d, dict):
+                      add(d.get("component") or d.get("name"),
+                          d.get("version"),
+                          d.get("purl"),
+                          norm_lic(d.get("license") or d.get("licenses")),
+                          d.get("vendor"))
+          bom = {
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.5",
+            "version": 1,
+            "serialNumber": f"urn:uuid:{uuid.uuid4()}",
+            "metadata": {
+              "timestamp": datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z",
+              "tools": [{"vendor":"SCANOSS","name":"scanoss-py","version":""}],
+            },
+            "components": comps
+          }
+          with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(bom, f, ensure_ascii=False, indent=2)
+          print(f"✅ Wrote CycloneDX: {out_path} (components={len(comps)})")
+          PY
+          echo "CDX_PATH=$OUT" >> "$GITHUB_ENV"
+
+      # -------------------------- Upload artifacts --------------------------
+      - name: Upload Compliance Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-scan-results-${{ env.SCAN_LABEL }}-${{ env.RUN_TAG }}
+          path: |
+            scanoss_${{ env.SCAN_LABEL }}.json
+            ${{ env.SCAN_LABEL }}_scanoss_components_report.xlsx
+            ${{ env.SCAN_LABEL }}_compliance_merged_report.xlsx
+            scanoss_${{ env.SCAN_LABEL }}.cdx.json
+          if-no-files-found: ignore
+
+      # -------------------------- Upload to Dependency-Track --------------------------
+      # Path A: If you supply an existing project UUID as secret DT_PROJECT_ID, we won't use a version at all.
+      - name: Upload SBOM to Dependency-Track (by project UUID - no version)
+        if: ${{ env.CDX_PATH != '' && secrets.DT_PROJECT_ID != '' }}
+        uses: DependencyTrack/gh-upload-sbom@v3
+        with:
+          protocol: ${{ env.DT_PROTOCOL }}
+          serverHostname: ${{ env.DT_SERVER_HOST }}
+          port: ${{ env.DT_PORT }}
+          apiKey: ${{ env.DT_API_KEY }}
+          project: ${{ secrets.DT_PROJECT_ID }}
+          bomFilename: ${{ env.CDX_PATH }}
+
+      # Path B: If a natural version exists, use name+version (auto-creates project)
+      - name: Upload SBOM to Dependency-Track (name+version)
+        if: ${{ env.CDX_PATH != '' && (secrets.DT_PROJECT_ID == '' || secrets.DT_PROJECT_ID == null) && env.PROJECT_VERSION != '' }}
+        uses: DependencyTrack/gh-upload-sbom@v3
+        with:
+          protocol: ${{ env.DT_PROTOCOL }}
+          serverHostname: ${{ env.DT_SERVER_HOST }}
+          port: ${{ env.DT_PORT }}
+          apiKey: ${{ env.DT_API_KEY }}
+          projectName: ${{ env.PROJECT_NAME }}
+          projectVersion: ${{ env.PROJECT_VERSION }}
+          bomFilename: ${{ env.CDX_PATH }}
+          autoCreate: true
+
+      # Path C: If no version is available, we keep version out of the logic you control.
+      # Dependency-Track typically requires a version with projectName when creating/identifying a project.
+      # To keep uploads working without a natural version, we fall back to RUN_TAG. If you want STRICT no-version,
+      # set a DT_PROJECT_ID secret and Path A will be used instead.
+      - name: Upload SBOM to Dependency-Track (fallback run id as version)
+        if: ${{ env.CDX_PATH != '' && (secrets.DT_PROJECT_ID == '' || secrets.DT_PROJECT_ID == null) && env.PROJECT_VERSION == '' }}
+        uses: DependencyTrack/gh-upload-sbom@v3
+        with:
+          protocol: ${{ env.DT_PROTOCOL }}
+          serverHostname: ${{ env.DT_SERVER_HOST }}
+          port: ${{ env.DT_PORT }}
+          apiKey: ${{ env.DT_API_KEY }}
+          projectName: ${{ env.PROJECT_NAME }}
+          projectVersion: ${{ env.RUN_TAG }}
+          bomFilename: ${{ env.CDX_PATH }}
+          autoCreate: true
