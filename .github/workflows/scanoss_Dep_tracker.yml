@@ -564,16 +564,3 @@ jobs:
           projectVersion: ${{ env.PROJECT_VERSION }}
           bomFilename: ${{ env.CDX_PATH }}
           autoCreate: true
-
-      - name: Upload SBOM to Dependency-Track (fallback: run id as version)
-        if: ${{ steps.mux.outputs.mode == 'fallback_runid' }}
-        uses: DependencyTrack/gh-upload-sbom@v3
-        with:
-          protocol: ${{ env.DT_PROTOCOL }}
-          serverHostname: ${{ env.DT_SERVER_HOST }}
-          port: ${{ env.DT_PORT }}
-          apiKey: ${{ env.DT_API_KEY }}
-          projectName: ${{ env.PROJECT_NAME }}
-          projectVersion: ${{ env.RUN_TAG }}
-          bomFilename: ${{ env.CDX_PATH }}
-          autoCreate: true
