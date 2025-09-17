@@ -42,19 +42,30 @@ on:
         default: 'true'
         type: boolean
 
+      archive_url:
+        description: 'Remote .zip or .tar(.gz|.xz) URL (used only when scan_type is upload-zip or upload-tar)'
+        required: false
+        default: ''
+
+      client_run_id:
+        description: 'Opaque run tag from the UI (for status + artifact lookup)'
+        required: false
+        default: ''
+
 jobs:
   oss-compliance:
     runs-on: ubuntu-latest
     env:
-      # === Required secrets ===
-      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}   # optional but recommended
-      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}   # optional private endpoint
-      DT_API_KEY:       ${{ secrets.DT_API_KEY }}       # create in Dependency-Track and add to repo secrets
+      # ========= Required secrets / config =========
+      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}      # optional but recommended
+      SCANOSS_API_URL: ${{ secrets.SCANOSS_API_URL }}      # optional private endpoint
 
-      # === Dependency-Track backend location (adjust port if reverse-proxied) ===
+      DT_API_KEY:       ${{ secrets.DT_API_KEY }}          # <-- add this in repo/org secrets
+
+      # Dependency-Track backend location (adjust if reverse-proxied)
       DT_PROTOCOL: http
       DT_SERVER_HOST: 3.110.199.92
-      DT_PORT: 8081   # if your /api is at :80 via reverse-proxy, change to 80
+      DT_PORT: 8081                                        # change to 80 if your /api is behind the UI proxy
 
     steps:
       # -------------------------- Setup --------------------------
@@ -217,7 +228,7 @@ jobs:
           echo "has_image=$HAS_IMAGE"  >> "$GITHUB_OUTPUT"
           echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
 
-      # ---------------- Label + run tag (sanitize for artifact names) ----------------
+      # ---------------- Label + run tag + project metadata ----------------
       - name: Set LABEL, PROJECT_NAME, PROJECT_VERSION env
         shell: bash
         run: |
@@ -229,7 +240,7 @@ jobs:
           [ -z "$SAN_RUN_TAG" ] && SAN_RUN_TAG="${GITHUB_RUN_ID}"
           SAN_RUN_TAG="${SAN_RUN_TAG:0:80}"
 
-          # SCAN_LABEL: from source (same logic path-aware)
+          # SCAN_LABEL from the chosen input
           MODE="${{ github.event.inputs.scan_type }}"
           RAW=""
           if [[ "$MODE" == "docker" ]]; then
@@ -250,14 +261,14 @@ jobs:
           [ -z "$SAN_LABEL" ] && SAN_LABEL="scan"
           SAN_LABEL="${SAN_LABEL:0:80}"
 
-          # Project name = input filename (no archive extensions)
+          # Project name = input filename (strip common archive extensions)
           NAME_BASE="${SAN_LABEL%.*}"
           case "$SAN_LABEL" in
             *.tar.gz|*.tgz) NAME_BASE="${SAN_LABEL%.tar.gz}";;
             *.tar.xz|*.txz) NAME_BASE="${SAN_LABEL%.tar.xz}";;
           esac
 
-          # Project version -> only if naturally available (docker tag/sha, git ref/sha)
+          # Project version -> only if naturally available
           PROJECT_VERSION=""
           if [[ "$MODE" == "docker" ]]; then
             if [[ "$RAW" =~ :([^@]+)$ ]]; then PROJECT_VERSION="${BASH_REMATCH[1]}"; fi
@@ -268,10 +279,10 @@ jobs:
             if [[ -n "$REF" ]]; then PROJECT_VERSION="$REF"; elif [[ -d repo-to-scan ]]; then PROJECT_VERSION="$(cd repo-to-scan && git rev-parse --short HEAD)"; fi
           fi
 
-          echo "SCAN_LABEL=$SAN_LABEL"        >> "$GITHUB_ENV"
-          echo "RUN_TAG=$SAN_RUN_TAG"         >> "$GITHUB_ENV"
-          echo "PROJECT_NAME=$NAME_BASE"      >> "$GITHUB_ENV"
-          echo "PROJECT_VERSION=$PROJECT_VERSION" >> "$GITHUB_ENV"
+          echo "SCAN_LABEL=$SAN_LABEL"              >> "$GITHUB_ENV"
+          echo "RUN_TAG=$SAN_RUN_TAG"               >> "$GITHUB_ENV"
+          echo "PROJECT_NAME=$NAME_BASE"            >> "$GITHUB_ENV"
+          echo "PROJECT_VERSION=$PROJECT_VERSION"   >> "$GITHUB_ENV"
           echo "🧾 Artifacts base: oss-scan-results-${SAN_LABEL}-${SAN_RUN_TAG}"
 
       # -------------------- SCANOSS (Docker) — choose mode --------------------
@@ -316,7 +327,7 @@ jobs:
           mkdir -p docker-output/exported-rootfs
           CID="$(docker create "$IMG_REF" /bin/true)"
           docker export "$CID" -o docker-output/rootfs.tar
-          docker rm "$CID" >/dev/null
+          docker rm "$CID" >/devnull 2>&1 || true
           tar -xf docker-output/rootfs.tar -C docker-output/exported-rootfs
           chmod -R a+rX docker-output/exported-rootfs || true
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
@@ -450,7 +461,7 @@ jobs:
           print(f"✅ Wrote Excel: {xlsx_main} and {xlsx_merged} (rows={len(df)})")
           PY
 
-      # ---------------- SCANOSS JSON ➜ CycloneDX (minimal, deduped) ----------------
+      # ---------------- SCANOSS JSON ➜ CycloneDX (minimal SBOM) ----------------
       - name: Build CycloneDX SBOM from SCANOSS JSON
         shell: bash
         run: |
@@ -468,24 +479,22 @@ jobs:
             if not x: return None
             s = str(x).strip()
             if not s: return None
-            # put as "name" to avoid asserting SPDX IDs incorrectly
             return {"license": {"name": s}}
           if os.path.exists(in_path) and os.path.getsize(in_path) > 0:
             with open(in_path, "r", encoding="utf-8") as f:
               data = json.load(f)
             def add(name, version, purl, lic, vendor):
-              key = purl or f"{name}@{version}"
+              key = (purl or f"{name}@{version}" or name or "") + (vendor or "")
               if not key: return
               if key in seen: return
               seen.add(key)
               c = {"type":"library"}
-              if name: c["name"] = name
+              if name: c["name"] = str(name)
               if version: c["version"] = str(version)
-              if purl: c["purl"] = purl
+              if purl: c["purl"] = str(purl)
               if lic: c["licenses"] = [lic]
-              if vendor: c["publisher"] = vendor
+              if vendor: c["publisher"] = str(vendor)
               comps.append(c)
-            # accept a few shapes
             if isinstance(data, dict):
               files = data.get("files") or data.get("identified") or []
               if isinstance(files, list):
@@ -550,10 +559,32 @@ jobs:
             scanoss_${{ env.SCAN_LABEL }}.cdx.json
           if-no-files-found: ignore
 
+      # -------------------------- Decide upload mode (NO secrets in if:) --------------------------
+      - name: Decide Dependency-Track upload mode
+        id: mux
+        env:
+          CDX_PATH:        ${{ env.CDX_PATH }}
+          DT_PROJECT_ID:   ${{ secrets.DT_PROJECT_ID }}   # optional secret; if set we upload by UUID and skip version entirely
+          PROJECT_VERSION: ${{ env.PROJECT_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODE=skip
+          if [[ -n "${CDX_PATH:-}" ]]; then
+            if [[ -n "${DT_PROJECT_ID:-}" ]]; then
+              MODE=by_uuid
+            elif [[ -n "${PROJECT_VERSION:-}" ]]; then
+              MODE=by_name_version
+            else
+              MODE=fallback_runid
+            fi
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Chosen upload mode: $MODE"
+
       # -------------------------- Upload to Dependency-Track --------------------------
-      # Path A: If you supply an existing project UUID as secret DT_PROJECT_ID, we won't use a version at all.
       - name: Upload SBOM to Dependency-Track (by project UUID - no version)
-        if: ${{ env.CDX_PATH != '' && secrets.DT_PROJECT_ID != '' }}
+        if: ${{ steps.mux.outputs.mode == 'by_uuid' }}
         uses: DependencyTrack/gh-upload-sbom@v3
         with:
           protocol: ${{ env.DT_PROTOCOL }}
@@ -563,9 +594,8 @@ jobs:
           project: ${{ secrets.DT_PROJECT_ID }}
           bomFilename: ${{ env.CDX_PATH }}
 
-      # Path B: If a natural version exists, use name+version (auto-creates project)
-      - name: Upload SBOM to Dependency-Track (name+version)
-        if: ${{ env.CDX_PATH != '' && (secrets.DT_PROJECT_ID == '' || secrets.DT_PROJECT_ID == null) && env.PROJECT_VERSION != '' }}
+      - name: Upload SBOM to Dependency-Track (name+version; auto-create ok)
+        if: ${{ steps.mux.outputs.mode == 'by_name_version' }}
         uses: DependencyTrack/gh-upload-sbom@v3
         with:
           protocol: ${{ env.DT_PROTOCOL }}
@@ -577,12 +607,8 @@ jobs:
           bomFilename: ${{ env.CDX_PATH }}
           autoCreate: true
 
-      # Path C: If no version is available, we keep version out of the logic you control.
-      # Dependency-Track typically requires a version with projectName when creating/identifying a project.
-      # To keep uploads working without a natural version, we fall back to RUN_TAG. If you want STRICT no-version,
-      # set a DT_PROJECT_ID secret and Path A will be used instead.
-      - name: Upload SBOM to Dependency-Track (fallback run id as version)
-        if: ${{ env.CDX_PATH != '' && (secrets.DT_PROJECT_ID == '' || secrets.DT_PROJECT_ID == null) && env.PROJECT_VERSION == '' }}
+      - name: Upload SBOM to Dependency-Track (fallback: run id as version)
+        if: ${{ steps.mux.outputs.mode == 'fallback_runid' }}
         uses: DependencyTrack/gh-upload-sbom@v3
         with:
           protocol: ${{ env.DT_PROTOCOL }}
