@@ -1,10 +1,4 @@
-name: OSS Compliance - SCANOSS CLI (Docker/Git/Upload) • manual or syft
-
-run-name: >-
-  SCANOSS ${{ github.event.inputs.scan_type }} •
-  mode=${{ github.event.inputs.image_scan_mode }} •
-  ${{ github.event.inputs.docker_image || github.event.inputs.git_url || github.event.inputs.archive_url || 'upload' }} •
-  ${{ github.event.inputs.client_run_id }}
+name: OSS Compliance - SCANOSS → CycloneDX → Dependency-Track (no version)
 
 on:
   workflow_dispatch:
@@ -57,7 +51,7 @@ jobs:
       DT_API_KEY: ${{ secrets.DT_API_KEY }}
       DT_PROTOCOL: http
       DT_SERVER_HOST: 3.110.199.92
-      DT_PORT: 8081   # will be auto-overridden by probe step if needed
+      DT_PORT: 8081   # will be overridden by probe if needed
 
     steps:
       # ---------- Setup ----------
@@ -80,7 +74,7 @@ jobs:
           python3 -m pip install --user scanoss pandas openpyxl
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install Syft (only if image_scan_mode == syft)
+      - name: Install Syft (if selected)
         if: ${{ github.event.inputs.image_scan_mode == 'syft' }}
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
@@ -211,7 +205,7 @@ jobs:
           echo "image_ref=$IMAGE_REF"  >> "$GITHUB_OUTPUT"
 
       # ---------- Labels, names ----------
-      - name: Set LABEL, PROJECT_NAME, PROJECT_VERSION env
+      - name: Set LABEL and PROJECT_NAME env (no version)
         shell: bash
         run: |
           set -euo pipefail
@@ -247,15 +241,13 @@ jobs:
             *.tar.xz|*.txz) NAME_BASE="${SAN_LABEL%.tar.xz}";;
           esac
 
-          # We intentionally keep PROJECT_VERSION empty; we'll upload to DT by UUID.
-          PROJECT_VERSION=""
-          echo "SCAN_LABEL=$SAN_LABEL"            >> "$GITHUB_ENV"
-          echo "RUN_TAG=$SAN_RUN_TAG"             >> "$GITHUB_ENV"
-          echo "PROJECT_NAME=$NAME_BASE"          >> "$GITHUB_ENV"
-          echo "PROJECT_VERSION=$PROJECT_VERSION" >> "$GITHUB_ENV"
+          echo "SCAN_LABEL=$SAN_LABEL"   >> "$GITHUB_ENV"
+          echo "RUN_TAG=$SAN_RUN_TAG"    >> "$GITHUB_ENV"
+          echo "PROJECT_NAME=$NAME_BASE" >> "$GITHUB_ENV"
+          echo "PROJECT_VERSION="        >> "$GITHUB_ENV"  # intentionally empty
 
       # ---------- SCANOSS ----------
-      - name: Run SCANOSS scan on Docker image (manual export)
+      - name: SCANOSS on Docker image (manual export)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' && github.event.inputs.image_scan_mode == 'manual' }}
         continue-on-error: true
         shell: bash
@@ -269,13 +261,13 @@ jobs:
           chmod -R a+rX docker-output/exported-rootfs || true
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS scan on Docker image (syft)
+      - name: SCANOSS on Docker image (syft)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type == 'docker' && github.event.inputs.image_scan_mode == 'syft' }}
         continue-on-error: true
         run: |
           scanoss-py container-scan "$DOCKER_IMAGE_REF" -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS on auto-built image (manual export)
+      - name: SCANOSS on auto-built image (manual export)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true' && github.event.inputs.image_scan_mode == 'manual' }}
         continue-on-error: true
         shell: bash
@@ -290,13 +282,13 @@ jobs:
           chmod -R a+rX docker-output/exported-rootfs || true
           scanoss-py scan -d docker-output/exported-rootfs -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS on auto-built image (syft)
+      - name: SCANOSS on auto-built image (syft)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && github.event.inputs.scan_type != 'docker' && steps.autodock.outputs.has_image == 'true' && github.event.inputs.image_scan_mode == 'syft' }}
         continue-on-error: true
         run: |
           scanoss-py container-scan "${{ steps.autodock.outputs.image_ref }}" -o "scanoss_${SCAN_LABEL}.json"
 
-      - name: Run SCANOSS scan on directory (git/upload)
+      - name: SCANOSS on directory (git/upload)
         if: ${{ github.event.inputs.enable_scanoss == 'true' && ((github.event.inputs.scan_type == 'git' && steps.autodock.outputs.has_image == 'false') || (github.event.inputs.scan_type == 'upload-zip' && steps.autodock.outputs.has_image == 'false') || (github.event.inputs.scan_type == 'upload-tar' && steps.autodock.outputs.has_image == 'false')) }}
         continue-on-error: true
         shell: bash
@@ -316,7 +308,6 @@ jobs:
           if [[ -f "$F" ]]; then
             echo "File: $F"
             echo "Size: $(wc -c < "$F") bytes"
-            echo "Preview:"
             head -c 2000 "$F" | sed 's/[^[:print:]\t]/?/g'
           else
             echo "JSON not found."
@@ -511,10 +502,10 @@ jobs:
             fi
           done
           echo "❌ Could not reach Dependency-Track API on ports 18081, 8081, or 80" >&2
-          echo "Open the port to GitHub runners or route /api via your reverse proxy."
+          echo "Open the port to GitHub runners or expose /api via your reverse proxy."
           exit 1
 
-      - name: Ensure DT project exists (no version) and get UUID
+      - name: Ensure DT project exists (name only) and get UUID
         id: ensure_project
         shell: bash
         env:
@@ -522,59 +513,45 @@ jobs:
         run: |
           set -euo pipefail
           host="${DT_SERVER_HOST}"; port="${DT_PORT}"
-          hdr=(-H "X-Api-Key: ${DT_API_KEY}" -H "Content-Type: application/json")
-          url() { printf "http://%s:%s%s" "$host" "$port" "$1"; }
+          url_base="http://${host}:${port}"
+          api_key="${DT_API_KEY}"
 
-          # --- Try to find an existing project by name with empty/null version ---
-          found=""
-          # Try a few discovery endpoints; ignore errors and parse what we can
-          for ep in "/api/v1/project?name=$(python3 - <<'PY'
-import urllib.parse,os; print(urllib.parse.quote(os.environ["NAME"]))
-PY
-)" "/api/v1/project?searchText=$(python3 - <<'PY'
-import urllib.parse,os; print(urllib.parse.quote(os.environ["NAME"]))
-PY
-)" "/api/v1/project"; do
-            resp="$(curl -fsS "$(url "$ep")" -H "X-Api-Key: ${DT_API_KEY}" 2>/dev/null || true)"
-            if [ -n "$resp" ]; then
-              uuid="$(echo "$resp" | jq -r \
-                '..|objects|select(has("name") and has("uuid")) | select(.name=="'"$NAME"'") | select((.version==null) or (.version=="")) | .uuid' | head -n1)"
-              if [ -n "${uuid}" ] && [ "${uuid}" != "null" ]; then found="$uuid"; break; fi
-            fi
-          done
+          # Try search
+          qname="$(python3 -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ['\''NAME'\'']))')"
+          resp="$(curl -fsS -H "X-Api-Key: ${api_key}" "${url_base}/api/v1/project?searchText=${qname}" || true)"
+          uuid="$(echo "$resp" | jq -r '.[] | select(.name=="'"$NAME"'") | .uuid' | head -n1)"
 
-          # If not found, try any project with the same name (any version) as a fallback
-          if [ -z "$found" ]; then
-            resp="$(curl -fsS "$(url "/api/v1/project")" -H "X-Api-Key: ${DT_API_KEY}" || true)"
-            uuid="$(echo "$resp" | jq -r \
-              '..|objects|select(has("name") and has("uuid")) | select(.name=="'"$NAME"'") | .uuid' | head -n1)"
-            if [ -n "${uuid}" ] && [ "${uuid}" != "null" ]; then found="$uuid"; fi
+          # Fallback: list all (may be paginated on huge installs)
+          if [ -z "$uuid" ] || [ "$uuid" = "null" ]; then
+            resp="$(curl -fsS -H "X-Api-Key: ${api_key}" "${url_base}/api/v1/project" || true)"
+            uuid="$(echo "$resp" | jq -r '.[] | select(.name=="'"$NAME"'") | .uuid' | head -n1)"
           fi
 
-          # If still not found, create a project WITHOUT a version
-          if [ -z "$found" ]; then
+          # Create if still not found (no version)
+          if [ -z "$uuid" ] || [ "$uuid" = "null" ]; then
             echo "Creating project '${NAME}' without version…"
-            body='{"name":"'"$NAME"'","classifier":"APPLICATION"}'
-            create="$(curl -fsS -X PUT "$(url "/api/v1/project")" "${hdr[@]}" -d "${body}" || true)"
+            body="$(jq -nc --arg name "$NAME" '{name:$name, classifier:"APPLICATION"}')"
+            create="$(curl -fsS -X PUT -H "X-Api-Key: ${api_key}" -H "Content-Type: application/json" \
+                          -d "$body" "${url_base}/api/v1/project" || true)"
             uuid="$(echo "$create" | jq -r '.uuid // empty')"
             if [ -z "$uuid" ]; then
-              # Some DT builds may expect an explicit empty version; try with version:""
-              body='{"name":"'"$NAME"'","version":"","classifier":"APPLICATION"}'
-              create="$(curl -fsS -X PUT "$(url "/api/v1/project")" "${hdr[@]}" -d "${body}" || true)"
+              # Some DT builds accept explicit empty version
+              body="$(jq -nc --arg name "$NAME" '{name:$name, version:"", classifier:"APPLICATION"}')"
+              create="$(curl -fsS -X PUT -H "X-Api-Key: ${api_key}" -H "Content-Type: application/json" \
+                            -d "$body" "${url_base}/api/v1/project" || true)"
               uuid="$(echo "$create" | jq -r '.uuid // empty')"
             fi
-            if [ -z "$uuid" ]; then
-              echo "❌ Failed to create project in Dependency-Track" >&2
-              echo "Response: $create" >&2
-              exit 1
-            fi
-            found="$uuid"
           fi
 
-          echo "project_uuid=$found" >> "$GITHUB_OUTPUT"
-          echo "✅ Using project UUID: $found"
+          if [ -z "$uuid" ]; then
+            echo "❌ Failed to ensure or create project '${NAME}'" >&2
+            exit 1
+          fi
 
-      - name: Upload SBOM to Dependency-Track (by project UUID; no version)
+          echo "project_uuid=$uuid" >> "$GITHUB_OUTPUT"
+          echo "✅ Using project UUID: $uuid"
+
+      - name: Upload SBOM to Dependency-Track (by UUID; no version)
         uses: DependencyTrack/gh-upload-sbom@v3
         with:
           protocol: ${{ env.DT_PROTOCOL }}
